@@ -1,0 +1,98 @@
+__include__: [
+  '../dfine/dfine_hgnetv2_n_custom.yml',
+  '../dataset/visdrone_detection.yml',
+  '../base/deim.yml'
+]
+
+print_freq: 20
+output_dir: ./outputs/deim_hgnetv2_n_visdrone_pointonly
+
+num_classes: 10
+remap_mscoco_category: False
+
+use_ema: True
+
+PointSupervision:
+  enabled: True
+  cost_point: 1.0
+  cost_class: 2.0
+  cost_prior: 1.0
+  score_thresh: 0.1
+  max_l1_dist: 2.0
+  snap_center: True
+  keep_all_points: False
+  DSPE:
+    enabled: True
+    base_size: 640
+    bag_size: 16
+    explore_ratio: 0.5
+    explore_wh_px: [2, 3, 4, 5, 6, 8, 10, 12, 16, 20, 24, 32, 40, 48, 64, 96, 128, 160, 192, 256]
+    update_top_frac: 0.1
+    update_beta: 0.005
+    update_score_thresh: 0.2
+    update_max_dist_px: 320
+    update_stab_thresh: 0.6
+    wh_override: False
+    pseudo_prior_mix: 0.0
+    pseudo_prior_mix_schedule: ~
+    wh_select_k: 32
+    bag_aspect_ratios: [0.5, 1.0, 2.0]
+    bag_wh_weight: 1.0
+    pseudo_min_wh_px: 2
+    pseudo_max_wh_px: 256
+    init_mean_wh_px: [8, 8]
+    init_std_wh_px: [8, 8]
+    min_std_px: [0.35, 0.35]
+    large_box_area_ratio_thresh: 2.0
+    large_box_area_penalty: 5.0
+    update_max_area_ratio: 10.0
+    log_interval: 200
+
+val_dataloader:
+  dataset:
+    img_folder: /home/pc/gxy/dataset/dataset_visdrone/VisDrone2019-DET-val/images
+    ann_file: /home/pc/gxy/dataset/dataset_visdrone/VisDrone2019-DET-val/annotations/val.json
+
+model: DEIM_MG
+
+DEIM_MG:
+  yaml_path: configs/cfg/dfine-n.yaml
+
+optimizer:
+  type: AdamW
+  params:
+    -
+      params: '^(?=.*backbone)(?!.*norm|bn).*$'
+      lr: 0.0004
+    -
+      params: '^(?=.*backbone)(?=.*norm|bn).*$'
+      lr: 0.0004
+      weight_decay: 0.
+    -
+      params: '^(?=.*(?:encoder|decoder))(?=.*(?:norm|bn|bias)).*$'
+      weight_decay: 0.
+
+  lr: 0.0008
+  betas: [0.9, 0.999]
+  weight_decay: 0.0001
+
+# Increase to search for the optimal ema
+epoches: 160 # 148 + 12
+
+## Our LR-Scheduler
+flat_epoch: 78    # 4 + epoch // 2, e.g., 40 = 4 + 72 / 2
+no_aug_epoch: 12
+lr_gamma: 1.0
+
+## Our DataAug
+train_dataloader:
+  dataset:
+    img_folder: /home/pc/gxy/dataset/dataset_visdrone/VisDrone2019-DET-train/images
+    ann_file: /home/pc/gxy/dataset/dataset_visdrone/deim_point_only_6px/annotations/instances_train.json
+    transforms:
+      policy:
+        epoch: [4, 78, 148]   # list
+  collate_fn:
+    mixup_epochs: [4, 78]
+    stop_epoch: 148
+    base_size_repeat: ~
