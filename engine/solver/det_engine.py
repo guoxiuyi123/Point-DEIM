@@ -295,7 +295,38 @@ def _build_point_pseudo_targets(teacher_outputs, targets, point_sup, use_focal_l
         if snap_center and kept_boxes.numel() > 0:
             kept_boxes = kept_boxes.clone()
             kept_boxes[:, :2] = kept_pts
- 
+
+        if kept_boxes.numel() > 0:
+            N = kept_pts.shape[0]
+            if N > 1:
+                pts_px = kept_pts.clone()
+                pts_px[:, 0] *= w_img if w_img > 0 else base_size
+                pts_px[:, 1] *= h_img if h_img > 0 else base_size
+                
+                dist_mat = torch.cdist(pts_px, pts_px, p=2)
+                dist_mat.fill_diagonal_(float('inf'))
+                min_dist_px = dist_mat.min(dim=1)[0]
+                
+                dynamic_max_wh_px = min_dist_px.unsqueeze(1).repeat(1, 2) * 1.5
+                global_max_wh = torch.tensor([256.0, 256.0], device=pts_px.device)
+                dynamic_max_wh_px = torch.min(dynamic_max_wh_px, global_max_wh)
+            else:
+                dynamic_max_wh_px = torch.tensor([[256.0, 256.0]], device=kept_pts.device)
+                
+            teacher_wh_px = kept_boxes[:, 2:].clone()
+            teacher_wh_px[:, 0] *= w_img if w_img > 0 else base_size
+            teacher_wh_px[:, 1] *= h_img if h_img > 0 else base_size
+            
+            pseudo_wh_px = torch.min(teacher_wh_px, dynamic_max_wh_px)
+            global_min_wh = torch.tensor([6.0, 6.0], device=kept_pts.device)
+            pseudo_wh_px = torch.max(pseudo_wh_px, global_min_wh)
+            
+            pseudo_wh_norm = pseudo_wh_px.clone()
+            pseudo_wh_norm[:, 0] /= w_img if w_img > 0 else base_size
+            pseudo_wh_norm[:, 1] /= h_img if h_img > 0 else base_size
+            
+            kept_boxes[:, 2:] = pseudo_wh_norm
+
         if dspe_enabled and num_classes > 0 and kept_boxes.numel() > 0:
             dist_px = kept_dists * base_size
             upd_wh_px = torch.clamp(kept_boxes[:, 2:].clamp(min=1e-6) * base_size, min=pseudo_min_wh_px, max=pseudo_max_wh_px)
