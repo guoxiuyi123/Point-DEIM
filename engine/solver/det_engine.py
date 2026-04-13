@@ -296,35 +296,57 @@ def _build_point_pseudo_targets(teacher_outputs, targets, point_sup, use_focal_l
             kept_boxes = kept_boxes.clone()
             kept_boxes[:, :2] = kept_pts
 
-        if kept_boxes.numel() > 0:
+        density_limit_cfg = point_sup.get("DensityLimit", None) or point_sup.get("density_limit", None) or {}
+        density_limit_enabled = not isinstance(density_limit_cfg, dict) or bool(density_limit_cfg.get("enabled", True))
+        density_knn_k = int(density_limit_cfg.get("knn_k", 1)) if isinstance(density_limit_cfg, dict) else 1
+        density_margin_factor = float(density_limit_cfg.get("density_margin_factor", 1.2)) if isinstance(density_limit_cfg, dict) else 1.2
+        density_class_margin_factors = density_limit_cfg.get("class_margin_factors", None) if isinstance(density_limit_cfg, dict) else None
+        density_global_max_wh_px = float(density_limit_cfg.get("global_max_wh_px", 256.0)) if isinstance(density_limit_cfg, dict) else 256.0
+        density_global_min_wh_px = float(density_limit_cfg.get("global_min_wh_px", 6.0)) if isinstance(density_limit_cfg, dict) else 6.0
+        density_use_input_hw = bool(density_limit_cfg.get("use_input_hw", True)) if isinstance(density_limit_cfg, dict) else True
+
+        if density_limit_enabled and kept_boxes.numel() > 0:
             N = kept_pts.shape[0]
+            px_w = float(w_img) if (density_use_input_hw and w_img > 0) else float(base_size)
+            px_h = float(h_img) if (density_use_input_hw and h_img > 0) else float(base_size)
             if N > 1:
                 pts_px = kept_pts.clone()
-                pts_px[:, 0] *= w_img if w_img > 0 else base_size
-                pts_px[:, 1] *= h_img if h_img > 0 else base_size
-                
+                pts_px[:, 0] *= px_w
+                pts_px[:, 1] *= px_h
+
                 dist_mat = torch.cdist(pts_px, pts_px, p=2)
                 dist_mat.fill_diagonal_(float('inf'))
-                min_dist_px = dist_mat.min(dim=1)[0]
-                
-                dynamic_max_wh_px = min_dist_px.unsqueeze(1).repeat(1, 2) * 1.5
-                global_max_wh = torch.tensor([256.0, 256.0], device=pts_px.device)
+                k = max(1, min(int(density_knn_k), N - 1))
+                knn_dists, _ = torch.topk(dist_mat, k=k, dim=1, largest=False)
+                knn_dist_px = knn_dists[:, -1]
+
+                margin_factor = torch.full_like(knn_dist_px, float(density_margin_factor))
+                if isinstance(density_class_margin_factors, dict) and kept_labels.numel() == margin_factor.numel():
+                    for k_cls, v_fac in density_class_margin_factors.items():
+                        try:
+                            cid = int(k_cls)
+                            fac = float(v_fac)
+                        except Exception:
+                            continue
+                        margin_factor = torch.where(kept_labels == cid, margin_factor.new_full((), fac), margin_factor)
+                dynamic_max_wh_px = knn_dist_px.unsqueeze(1).repeat(1, 2) * margin_factor.unsqueeze(1)
+                global_max_wh = torch.tensor([density_global_max_wh_px, density_global_max_wh_px], device=pts_px.device)
                 dynamic_max_wh_px = torch.min(dynamic_max_wh_px, global_max_wh)
             else:
-                dynamic_max_wh_px = torch.tensor([[256.0, 256.0]], device=kept_pts.device)
-                
+                dynamic_max_wh_px = torch.tensor([[density_global_max_wh_px, density_global_max_wh_px]], device=kept_pts.device)
+
             teacher_wh_px = kept_boxes[:, 2:].clone()
-            teacher_wh_px[:, 0] *= w_img if w_img > 0 else base_size
-            teacher_wh_px[:, 1] *= h_img if h_img > 0 else base_size
-            
+            teacher_wh_px[:, 0] *= px_w
+            teacher_wh_px[:, 1] *= px_h
+
             pseudo_wh_px = torch.min(teacher_wh_px, dynamic_max_wh_px)
-            global_min_wh = torch.tensor([6.0, 6.0], device=kept_pts.device)
+            global_min_wh = torch.tensor([density_global_min_wh_px, density_global_min_wh_px], device=kept_pts.device)
             pseudo_wh_px = torch.max(pseudo_wh_px, global_min_wh)
-            
+
             pseudo_wh_norm = pseudo_wh_px.clone()
-            pseudo_wh_norm[:, 0] /= w_img if w_img > 0 else base_size
-            pseudo_wh_norm[:, 1] /= h_img if h_img > 0 else base_size
-            
+            pseudo_wh_norm[:, 0] /= px_w
+            pseudo_wh_norm[:, 1] /= px_h
+
             kept_boxes[:, 2:] = pseudo_wh_norm
 
         if dspe_enabled and num_classes > 0 and kept_boxes.numel() > 0:

@@ -23,6 +23,14 @@ PointSupervision:
   max_l1_dist: 0.25
   snap_center: True
   keep_all_points: False
+  DensityLimit:
+    enabled: True
+    knn_k: 1
+    density_margin_factor: 1.2
+    class_margin_factors: {3: 2.0, 4: 2.0, 9: 2.0, 5: 2.5, 8: 2.5}
+    global_max_wh_px: 256.0
+    global_min_wh_px: 6.0
+    use_input_hw: True
   DSPE:
     enabled: True
     base_size: 640
