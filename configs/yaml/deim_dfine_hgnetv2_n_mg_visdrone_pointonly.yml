@@ -12,6 +12,8 @@ remap_mscoco_category: False
 
 use_ema: True
 
+find_unused_parameters: False
+
 PointSupervision:
   enabled: True
   cost_point: 1.0
