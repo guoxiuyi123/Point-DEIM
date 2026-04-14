@@ -21,5 +21,3 @@ from ._transforms import (
 ) 
 from .container import Compose 
 from .mosaic import Mosaic
-from .multimodal_container import MultimodalCompose
-from .multimodal_mosaic import MultimodalMosaic

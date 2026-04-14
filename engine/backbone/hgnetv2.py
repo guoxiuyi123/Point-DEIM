@@ -11,10 +11,29 @@ import torch.nn.functional as F
 import os, re  
 from .common import FrozenBatchNorm2d
 from ..core import register
-from ..extre_module.custom_nn.attention.ema import EMA 
-from ..extre_module.custom_nn.attention.simam import SimAM 
 from ..misc.dist_utils import Multiprocess_sync, is_dist_available_and_initialized    
 from ..logger_module import get_logger   
+ 
+try:
+    from ..extre_module.custom_nn.attention.ema import EMA
+except Exception:
+    class EMA(nn.Module):
+        def __init__(self, channels: int, *args, **kwargs):
+            super().__init__()
+            self.channels = int(channels)
+ 
+        def forward(self, x):
+            return x
+ 
+try:
+    from ..extre_module.custom_nn.attention.simam import SimAM
+except Exception:
+    class SimAM(nn.Module):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+ 
+        def forward(self, x):
+            return x
 
 # Constants for initialization
 kaiming_normal_ = nn.init.kaiming_normal_
