@@ -21,7 +21,6 @@ import json
 import argparse
 
 from engine.logger_module import get_logger
-from engine.extre_module.torch_utils import check_cuda
 from engine.misc import dist_utils
 from engine.core import YAMLConfig, yaml_utils
 from engine.solver import TASKS
@@ -41,7 +40,9 @@ def main(args, ) -> None:
     """main
     """
     dist_utils.setup_distributed(args.print_rank, args.print_method, seed=args.seed)
-    check_cuda()
+    import torch
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
 
     assert not all([args.tuning, args.resume]), \
         'Only support from_scrach or resume or tuning at one time'

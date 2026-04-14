@@ -5,8 +5,6 @@ Copyright (c) 2024 The DEIM Authors. All Rights Reserved.
 
 import math     
 from functools import partial
-import matplotlib.pyplot as plt 
-from ..extre_module.utils import plt_settings, TryExcept 
 from ..logger_module import get_logger
 logger = get_logger(__name__)
 
@@ -96,9 +94,6 @@ class FlatCosineLRScheduler:
 
         # **4. 绑定 `flat_cosine_schedule` 计算函数**   
         self.lr_func = partial(flat_cosine_schedule, total_iter, warmup_iter, flat_iter, no_aug_iter)     
-     
-        for i, _ in enumerate(optimizer.param_groups):    
-            plot_lr_schedule(total_iter, warmup_iter, flat_iter, no_aug_iter, self.base_lrs[i], self.min_lrs[i], lr_scyedule_save_path / f"lr_schedule_{i}.png") 
 
     def step(self, current_iter, optimizer):
         """  
@@ -113,40 +108,3 @@ class FlatCosineLRScheduler:
             group["lr"] = self.lr_func(current_iter, self.base_lrs[i], self.min_lrs[i]) # 计算并设置新学习率
         return optimizer # 返回更新后的优化器  
     
-@TryExcept('WARNING ⚠️ plot_lr_schedule failed.')
-@plt_settings()    
-def plot_lr_schedule(total_iter, warmup_iter, flat_iter, no_aug_iter, init_lr, min_lr, save_path):
-    is_four_stage = True    
-    iters = list(range(total_iter))  
-    if flat_iter == (total_iter - warmup_iter):
-        is_four_stage = False
-    lrs = [flat_cosine_schedule(total_iter, warmup_iter, flat_iter, no_aug_iter, i, init_lr, min_lr) for i in iters]    
-     
-    plt.figure(figsize=(8, 5))
-    plt.plot(iters, lrs, label='Learning Rate')
-    plt.axvline(x=warmup_iter, color='r', linestyle='--', label='Warmup End') 
-    if is_four_stage:  
-        plt.axvline(x=flat_iter, color='g', linestyle='--', label='Flat End') 
-        plt.axvline(x=total_iter - no_aug_iter, color='b', linestyle='--', label='No Aug Start')
-    else:
-        plt.axvline(x=flat_iter + warmup_iter, color='g', linestyle='--', label='Flat End')
-    plt.xlabel('Iterations')
-    plt.ylabel('Learning Rate')
-    plt.title('Flat Cosine Learning Rate Schedule')     
-    plt.legend()     
-    plt.grid()
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=300)     
-    plt.close('all')
-
-if __name__ == '__main__':   
-    # 参数设置  
-    total_iter = 10000     
-    warmup_iter = 1000
-    flat_iter = 3000  
-    no_aug_iter = 500
-    init_lr = 0.01 
-    min_lr = 0.0001 
-  
-    # 绘制学习率曲线   
-    plot_lr_schedule(total_iter, warmup_iter, flat_iter, no_aug_iter, init_lr, min_lr)  

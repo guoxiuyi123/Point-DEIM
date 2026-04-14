@@ -10,13 +10,29 @@ import torch.utils.data
 import torchvision
 from typing import Any, BinaryIO, List, Optional, Tuple, Union
 from PIL import Image, ImageColor, ImageDraw, ImageFont  
-from ..extre_module.utils import plt_settings, TryExcept
 torchvision.disable_beta_transforms_warning()
 
 __all__ = ['plot_sample']
 
 DINOV3_MEAN = torch.from_numpy(np.array([0.485, 0.456, 0.406]))    
 DINOV3_STD = torch.from_numpy(np.array([0.229, 0.224, 0.225]))
+
+def TryExcept(msg=''):
+    def deco(func):
+        def wrapper(*args, **kwargs):
+            try:
+                return func(*args, **kwargs)
+            except Exception:
+                return None
+        return wrapper
+    return deco
+
+def plt_settings():
+    def deco(func):
+        def wrapper(*args, **kwargs):
+            return func(*args, **kwargs)
+        return wrapper
+    return deco
      
 @torch.no_grad()  
 def draw_bounding_boxes(  

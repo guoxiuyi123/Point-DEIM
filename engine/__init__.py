@@ -6,7 +6,6 @@ Copyright (c) 2024 The DEIM Authors. All Rights Reserved.
 from . import optim
 from . import data
 from . import deim     
-from . import extre_module
 
 from .backbone import *
 

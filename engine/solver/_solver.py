@@ -11,11 +11,24 @@ import atexit
 from ..data.dataset.coco_dataset import mscoco_category2label
 from ..misc import dist_utils
 from ..core import BaseConfig   
-from ..extre_module.utils import increment_path
 from ..logger_module import get_logger
      
 RED, GREEN, BLUE, YELLOW, ORANGE, RESET = "\033[91m", "\033[92m", "\033[94m", "\033[93m", "\033[38;5;208m", "\033[0m"     
 logger = get_logger(__name__)
+
+def increment_path(path, exist_ok=False, sep='', mkdir=False):
+    path = Path(path)
+    if exist_ok or not path.exists():
+        if mkdir:
+            path.mkdir(parents=True, exist_ok=True)
+        return path
+    for n in range(2, 10000):
+        p = Path(f"{path}{sep}{n}")
+        if not p.exists():
+            if mkdir:
+                p.mkdir(parents=True, exist_ok=True)
+            return p
+    return path
      
 def to(m: nn.Module, device: str):     
     if m is None: 

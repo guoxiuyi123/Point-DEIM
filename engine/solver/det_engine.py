@@ -8,6 +8,7 @@ Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved.
 
 
 import os, sys     
+import time
 import math
 import json
 import gc
@@ -28,9 +29,6 @@ from ..data import CocoEvaluator
 from ..misc import MetricLogger, MetricLogger_progress, SmoothedValue, dist_utils, plot_sample     
 from ..misc.modality_utils import normalize_tensor_minmax_per_sample 
 from ..logger_module import get_logger     
-from ..extre_module.ops import Profile
-from ..extre_module.utils import TQDM, RANK
-# from ..extre_module.yolo_metrice import get_yolo_det_metrice, get_yolo_seg_metrice 
 from ..deim.utils import coco_evaluator_per_class 
 from .sample_adapter import (
     move_samples_to_device,
@@ -39,6 +37,21 @@ from .sample_adapter import (
 )    
 
 from pycocoeval.yoloeval import get_yolo_det_metrice, get_yolo_seg_metrice 
+
+class Profile:
+    def __init__(self, device=None):
+        self.device = device
+        self.t = 0.0
+    def __enter__(self):
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        self._start = time.perf_counter()
+        return self
+    def __exit__(self, exc_type, exc, tb):
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        self.t += time.perf_counter() - self._start
+        return False
 
 CLEAR_MEMORY_STEP = 100    
 TIME_DEBUG = False

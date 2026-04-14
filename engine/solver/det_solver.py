@@ -20,12 +20,10 @@ from ..misc import dist_utils, stats, get_weight_size
 
 from ._solver import BaseSolver, ModelSaverFunc  
 from .det_engine import train_one_epoch, distill_one_epoch, evaluate, _ScaleMemoryBank     
-from .afss import AFSSController
 from .sample_adapter import move_samples_to_device, select_model_input, select_model_input_for_model
 from ..optim.lr_scheduler import FlatCosineLRScheduler 
 from ..logger_module import get_logger
-from ..extre_module.torch_utils import FeatureExtractor
-from ..extre_module.distill_utils import FeatureLoss, DETRLogicLoss, DETRMutilDecoderLogicLoss   
+AFSSController = None
    
 RED, GREEN, BLUE, YELLOW, ORANGE, RESET = "\033[91m", "\033[92m", "\033[94m", "\033[93m", "\033[38;5;208m", "\033[0m"
 logger = get_logger(__name__)     
@@ -118,6 +116,8 @@ class DetSolver(BaseSolver):
         afss_cfg = self.cfg.yaml_cfg.get('AFSS', {})
         if not afss_cfg.get('enabled', False):  
             return
+        if AFSSController is None:
+            raise RuntimeError("AFSS is not available in this slim Point-DEIM setup.")
 
         if self.afss is None:     
             controller_params = set(inspect.signature(AFSSController.__init__).parameters.keys()) - {'self'}  
@@ -618,6 +618,7 @@ class DetSolver(BaseSolver):
         return
     
     def distill(self, student_cfg_str, teacher_cfg_str, teacher_cfg):
+        raise RuntimeError("Distillation is not available in this slim Point-DEIM setup.")
         self.train()
         args = self.cfg 
     
@@ -648,8 +649,8 @@ class DetSolver(BaseSolver):
         n_parameters, model_stats = stats(teacher_cfg)   
         print(model_stats)
  
-        student_is_Ultralytics = self.cfg.yaml_cfg['model'] == 'DEIM_MG'
-        teacher_is_Ultralytics = teacher_cfg.yaml_cfg['model'] == 'DEIM_MG'
+        student_is_Ultralytics = False
+        teacher_is_Ultralytics = False
         logger.info(RED + f'student_is_Ultralytics:{student_is_Ultralytics} teacher_is_Ultralytics:{teacher_is_Ultralytics}' + RESET)
 
         # teacher model init

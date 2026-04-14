@@ -69,10 +69,7 @@ val_dataloader:
     img_folder: /home/pc/gxy/dataset/dataset_visdrone/VisDrone2019-DET-val/images
     ann_file: /home/pc/gxy/dataset/dataset_visdrone/VisDrone2019-DET-val/annotations/val.json
 
-model: DEIM_MG
-
-DEIM_MG:
-  yaml_path: configs/cfg/dfine-n.yaml
+model: DEIM
 
 DEIMCriterion:
   weight_dict: {loss_mal: 1, loss_bbox: 0, loss_giou: 0, loss_fgl: 0.15, loss_ddf: 1.5, loss_points_mil_reg: 5}

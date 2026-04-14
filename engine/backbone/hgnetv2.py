@@ -11,8 +11,6 @@ import torch.nn.functional as F
 import os, re  
 from .common import FrozenBatchNorm2d
 from ..core import register
-from ..extre_module.custom_nn.attention.ema import EMA 
-from ..extre_module.custom_nn.attention.simam import SimAM 
 from ..misc.dist_utils import Multiprocess_sync, is_dist_available_and_initialized    
 from ..logger_module import get_logger   
 
@@ -25,6 +23,27 @@ logger = get_logger(__name__)
 RED, GREEN, RESET = "\033[91m", "\033[92m", "\033[0m"
   
 __all__ = ['HGNetv2']   
+
+class EMA(nn.Module):
+    def __init__(self, channels: int):
+        super().__init__()
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.conv = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
+        self.act = nn.Sigmoid()
+    def forward(self, x):
+        w = self.act(self.conv(self.pool(x)))
+        return x * w
+
+class SimAM(nn.Module):
+    def __init__(self, eps: float = 1e-5):
+        super().__init__()
+        self.eps = float(eps)
+    def forward(self, x):
+        mu = x.mean(dim=(2, 3), keepdim=True)
+        v = (x - mu).pow(2)
+        s = v.mean(dim=(2, 3), keepdim=True)
+        a = v / (s + self.eps) + 0.5
+        return x * torch.sigmoid(a)
   
 class LearnableAffineBlock(nn.Module):    
     """
