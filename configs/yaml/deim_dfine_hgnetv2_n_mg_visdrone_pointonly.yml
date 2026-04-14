@@ -31,6 +31,12 @@ PointSupervision:
     global_max_wh_px: 256.0
     global_min_wh_px: 6.0
     use_input_hw: True
+  FeatureGrowth:
+    enabled: True
+    feature_level: 1
+    feature_key: pseudo_feat
+    tau: 0.65
+    min_mask_px: 6
   DSPE:
     enabled: True
     base_size: 640
@@ -67,6 +73,10 @@ model: DEIM_MG
 
 DEIM_MG:
   yaml_path: configs/cfg/dfine-n.yaml
+
+DEIMCriterion:
+  weight_dict: {loss_mal: 1, loss_bbox: 0, loss_giou: 0, loss_fgl: 0.15, loss_ddf: 1.5, loss_points_mil_reg: 5}
+  losses: ['mal', 'points_mil_reg', 'local']
 
 optimizer:
   type: AdamW

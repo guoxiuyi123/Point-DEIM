@@ -19,6 +19,7 @@ from scipy.optimize import linear_sum_assignment
 
 import torch    
 import torch.amp
+import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter  
 from torch.cuda.amp.grad_scaler import GradScaler
  
@@ -162,6 +163,11 @@ def _build_point_pseudo_targets(teacher_outputs, targets, point_sup, use_focal_l
     max_l1_dist = float(point_sup.get("max_l1_dist", 1.0))
     snap_center = bool(point_sup.get("snap_center", True))
     keep_all_points = bool(point_sup.get("keep_all_points", True))
+    fg_cfg = point_sup.get("FeatureGrowth", None) or point_sup.get("feature_growth", None) or {}
+    fg_enabled = isinstance(fg_cfg, dict) and bool(fg_cfg.get("enabled", False))
+    fg_tau = float(fg_cfg.get("tau", 0.65)) if fg_enabled else 0.0
+    fg_min_mask_px = int(fg_cfg.get("min_mask_px", 6)) if fg_enabled else 0
+    fg_feat_key = str(fg_cfg.get("feature_key", "pseudo_feat")) if fg_enabled else ""
     dspe_cfg = point_sup.get("DSPE", None) or point_sup.get("dspe", None) or {}
     dspe_enabled = isinstance(dspe_cfg, dict) and dspe_cfg.get("enabled", False) and point_sup_state is not None and point_sup_state.get("scale_bank", None) is not None
     base_size = float(dspe_cfg.get("base_size", 640.0))
@@ -291,6 +297,7 @@ def _build_point_pseudo_targets(teacher_outputs, targets, point_sup, use_focal_l
         kept_dists = selected_dists[keep]
         kept_stab = selected_stab[keep]
         total_pseudo += float(kept_labels.numel())
+        mil_boxes = None
  
         if snap_center and kept_boxes.numel() > 0:
             kept_boxes = kept_boxes.clone()
@@ -339,7 +346,39 @@ def _build_point_pseudo_targets(teacher_outputs, targets, point_sup, use_focal_l
             teacher_wh_px[:, 0] *= px_w
             teacher_wh_px[:, 1] *= px_h
 
-            pseudo_wh_px = torch.min(teacher_wh_px, dynamic_max_wh_px)
+            b_vis_wh_px = teacher_wh_px
+            if fg_enabled:
+                feat_all = teacher_outputs.get(fg_feat_key, None) if isinstance(teacher_outputs, dict) else None
+                if isinstance(feat_all, torch.Tensor) and feat_all.ndim == 4 and int(feat_all.shape[0]) > int(b):
+                    fmap = feat_all[b:b + 1].float()
+                    fmap = torch.nan_to_num(fmap, nan=0.0, posinf=0.0, neginf=0.0)
+                    fmap_n = F.normalize(fmap, dim=1, eps=1e-6)
+                    grid = kept_pts * 2.0 - 1.0
+                    grid = grid.view(1, -1, 1, 2)
+                    v_center = F.grid_sample(fmap_n, grid, align_corners=True, mode="bilinear", padding_mode="zeros")
+                    v_center = v_center[0, :, :, 0].transpose(0, 1).contiguous()
+                    v_center = F.normalize(v_center, dim=1, eps=1e-6)
+                    sim = torch.einsum("bchw,nc->bnhw", fmap_n, v_center)[0]
+                    stride_w = px_w / float(fmap.shape[-1])
+                    stride_h = px_h / float(fmap.shape[-2])
+                    out_wh = []
+                    for ii in range(int(sim.shape[0])):
+                        mask = sim[ii] > float(fg_tau)
+                        if bool(mask.any()):
+                            idx = torch.nonzero(mask, as_tuple=False)
+                            if int(idx.shape[0]) >= int(fg_min_mask_px):
+                                y0 = int(idx[:, 0].min().item())
+                                y1 = int(idx[:, 0].max().item())
+                                x0 = int(idx[:, 1].min().item())
+                                x1 = int(idx[:, 1].max().item())
+                                wv = max(1.0, float(x1 - x0 + 1) * float(stride_w))
+                                hv = max(1.0, float(y1 - y0 + 1) * float(stride_h))
+                                out_wh.append([wv, hv])
+                                continue
+                        out_wh.append([float(b_vis_wh_px[ii, 0].item()), float(b_vis_wh_px[ii, 1].item())])
+                    b_vis_wh_px = torch.as_tensor(out_wh, device=kept_pts.device, dtype=torch.float32)
+
+            pseudo_wh_px = torch.min(b_vis_wh_px, dynamic_max_wh_px)
             global_min_wh = torch.tensor([density_global_min_wh_px, density_global_min_wh_px], device=kept_pts.device)
             pseudo_wh_px = torch.max(pseudo_wh_px, global_min_wh)
 
@@ -348,6 +387,17 @@ def _build_point_pseudo_targets(teacher_outputs, targets, point_sup, use_focal_l
             pseudo_wh_norm[:, 1] /= px_h
 
             kept_boxes[:, 2:] = pseudo_wh_norm
+            if kept_pts.numel() > 0:
+                cand_teacher = teacher_wh_px
+                cand_vis = b_vis_wh_px
+                cand_clip_teacher = torch.min(teacher_wh_px, dynamic_max_wh_px)
+                cands = torch.stack([cand_teacher, cand_vis, cand_clip_teacher], dim=1)
+                cands = torch.clamp(cands, min=density_global_min_wh_px, max=density_global_max_wh_px)
+                cands_norm = cands.clone()
+                cands_norm[:, :, 0] /= px_w
+                cands_norm[:, :, 1] /= px_h
+                centers = kept_pts[:, None, :].repeat(1, cands_norm.shape[1], 1)
+                mil_boxes = torch.cat([centers, cands_norm], dim=2).clamp(min=0.0, max=1.0)
 
         if dspe_enabled and num_classes > 0 and kept_boxes.numel() > 0:
             dist_px = kept_dists * base_size
@@ -381,6 +431,8 @@ def _build_point_pseudo_targets(teacher_outputs, targets, point_sup, use_focal_l
         t_new = dict(t)
         t_new["boxes"] = kept_boxes
         t_new["labels"] = kept_labels
+        if mil_boxes is not None:
+            t_new["mil_boxes"] = mil_boxes
         pseudo_targets.append(t_new)
  
     if dspe_enabled and num_classes > 0 and sums is not None and counts is not None:
@@ -501,8 +553,17 @@ def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, cri
                     if _is_point_supervision_enabled(point_sup):
                         if ema is None:
                             raise RuntimeError("PointSupervision requires EMA teacher. Set use_ema=True.")
+                        fg_cfg = point_sup.get("FeatureGrowth", None) or point_sup.get("feature_growth", None) or {}
+                        fg_enabled = isinstance(fg_cfg, dict) and bool(fg_cfg.get("enabled", False))
+                        fg_level = int(fg_cfg.get("feature_level", 1)) if fg_enabled else 0
                         with torch.no_grad():
-                            teacher_outputs = ema.module(model_inputs, targets=None)
+                            if fg_enabled:
+                                try:
+                                    teacher_outputs = ema.module(model_inputs, targets=None, return_feature=True, feature_level=fg_level)
+                                except TypeError:
+                                    teacher_outputs = ema.module(model_inputs, targets=None)
+                            else:
+                                teacher_outputs = ema.module(model_inputs, targets=None)
                         targets_for_train = _build_point_pseudo_targets(
                             teacher_outputs,
                             targets,
@@ -552,8 +613,17 @@ def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, cri
                 if _is_point_supervision_enabled(point_sup):
                     if ema is None:
                         raise RuntimeError("PointSupervision requires EMA teacher. Set use_ema=True.")
+                    fg_cfg = point_sup.get("FeatureGrowth", None) or point_sup.get("feature_growth", None) or {}
+                    fg_enabled = isinstance(fg_cfg, dict) and bool(fg_cfg.get("enabled", False))
+                    fg_level = int(fg_cfg.get("feature_level", 1)) if fg_enabled else 0
                     with torch.no_grad():
-                        teacher_outputs = ema.module(model_inputs, targets=None)
+                        if fg_enabled:
+                            try:
+                                teacher_outputs = ema.module(model_inputs, targets=None, return_feature=True, feature_level=fg_level)
+                            except TypeError:
+                                teacher_outputs = ema.module(model_inputs, targets=None)
+                        else:
+                            teacher_outputs = ema.module(model_inputs, targets=None)
                     targets_for_train = _build_point_pseudo_targets(
                         teacher_outputs,
                         targets,

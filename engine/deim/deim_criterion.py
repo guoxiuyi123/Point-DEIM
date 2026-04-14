@@ -303,6 +303,39 @@ class DEIMCriterion(nn.Module):
 
         return losses
 
+    def loss_points_mil_reg(self, outputs, targets, indices, num_boxes, beta: float = 10.0):
+        assert 'pred_boxes' in outputs
+        idx = self._get_src_permutation_idx(indices)
+        src_boxes = outputs['pred_boxes'][idx]
+        if src_boxes.numel() == 0:
+            return {'loss_points_mil_reg': src_boxes.sum()}
+        cand_list = []
+        for t, (_, j) in zip(targets, indices):
+            mb = t.get('mil_boxes', None)
+            if not isinstance(mb, torch.Tensor) or mb.numel() == 0:
+                cand_list.append(None)
+            else:
+                cand_list.append(mb[j])
+        if any(x is None for x in cand_list):
+            return {'loss_points_mil_reg': src_boxes.sum() * 0.0}
+        cand_boxes = torch.cat(cand_list, dim=0).to(src_boxes.device).float()
+        if cand_boxes.ndim != 3 or cand_boxes.shape[0] != src_boxes.shape[0]:
+            return {'loss_points_mil_reg': src_boxes.sum() * 0.0}
+        m = int(cand_boxes.shape[1])
+        src_wh = src_boxes[:, 2:].clamp(min=1e-6)
+        cand_wh = cand_boxes[:, :, 2:].clamp(min=1e-6)
+        l1_wh = torch.abs(src_wh[:, None, :] - cand_wh).sum(dim=-1)
+        src_flat = src_boxes[:, None, :].repeat(1, m, 1).reshape(-1, 4)
+        cand_flat = cand_boxes.reshape(-1, 4)
+        src_xyxy = box_cxcywh_to_xyxy(src_flat)
+        cand_xyxy = box_cxcywh_to_xyxy(cand_flat)
+        giou = bbox_iou_aligned_xyxy(src_xyxy, cand_xyxy, iou_type='giou')
+        liou = (1.0 - giou).view(-1, m).clamp(min=0.0, max=2.0)
+        total = l1_wh + liou
+        w = torch.softmax(-float(beta) * total, dim=1)
+        loss = (w * total).sum(dim=1).sum() / num_boxes
+        return {'loss_points_mil_reg': loss}
+
     def loss_local(self, outputs, targets, indices, num_boxes, T=5): 
         """Compute Fine-Grained Localization (FGL) Loss
             and Decoupled Distillation Focal (DDF) Loss. """
@@ -495,6 +528,7 @@ class DEIMCriterion(nn.Module):
     def get_loss(self, loss, outputs, targets, indices, num_boxes, **kwargs):    
         loss_map = { 
             'boxes': self.loss_boxes,
+            'points_mil_reg': self.loss_points_mil_reg,
             'focal': self.loss_labels_focal,     
             'vfl': self.loss_labels_vfl,  
             'mal': self.loss_labels_mal,
