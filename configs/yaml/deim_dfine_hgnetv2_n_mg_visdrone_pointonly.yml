@@ -36,6 +36,7 @@ PointSupervision:
     feature_level: 1
     feature_key: pseudo_feat
     tau: 0.65
+    taus: [0.5, 0.6, 0.7, 0.8]
     min_mask_px: 6
   DSPE:
     enabled: True
@@ -62,6 +63,7 @@ PointSupervision:
     large_box_area_ratio_thresh: 2.0
     large_box_area_penalty: 5.0
     update_max_area_ratio: 10.0
+    mil_candidate: True
     log_interval: 200
 
 val_dataloader:
@@ -74,6 +76,7 @@ model: DEIM
 DEIMCriterion:
   weight_dict: {loss_mal: 1, loss_bbox: 0, loss_giou: 0, loss_fgl: 0.15, loss_ddf: 1.5, loss_points_mil_reg: 5}
   losses: ['mal', 'points_mil_reg', 'local']
+  mil_beta_score: 10.0
 
 optimizer:
   type: AdamW

@@ -179,6 +179,9 @@ def _build_point_pseudo_targets(teacher_outputs, targets, point_sup, use_focal_l
     fg_cfg = point_sup.get("FeatureGrowth", None) or point_sup.get("feature_growth", None) or {}
     fg_enabled = isinstance(fg_cfg, dict) and bool(fg_cfg.get("enabled", False))
     fg_tau = float(fg_cfg.get("tau", 0.65)) if fg_enabled else 0.0
+    fg_taus = fg_cfg.get("taus", None) if fg_enabled else None
+    if fg_enabled and fg_taus is None:
+        fg_taus = fg_cfg.get("tau_list", None)
     fg_min_mask_px = int(fg_cfg.get("min_mask_px", 6)) if fg_enabled else 0
     fg_feat_key = str(fg_cfg.get("feature_key", "pseudo_feat")) if fg_enabled else ""
     dspe_cfg = point_sup.get("DSPE", None) or point_sup.get("dspe", None) or {}
@@ -236,7 +239,7 @@ def _build_point_pseudo_targets(teacher_outputs, targets, point_sup, use_focal_l
         sums = torch.zeros((num_classes, 2), dtype=torch.float32, device=pred_boxes.device)
         sums_sq = torch.zeros((num_classes, 2), dtype=torch.float32, device=pred_boxes.device)
         counts = torch.zeros((num_classes,), dtype=torch.float32, device=pred_boxes.device)
-        mu_logwh, _ = bank.get_stats(device=pred_boxes.device)
+        mu_logwh, var_logwh = bank.get_stats(device=pred_boxes.device)
         prior_wh_px = torch.clamp(mu_logwh.exp(), min=1.0)
         prior_wh_px = torch.clamp(prior_wh_px, min=pseudo_min_wh_px, max=pseudo_max_wh_px)
         prior_wh_norm = prior_wh_px / base_size
@@ -311,6 +314,7 @@ def _build_point_pseudo_targets(teacher_outputs, targets, point_sup, use_focal_l
         kept_stab = selected_stab[keep]
         total_pseudo += float(kept_labels.numel())
         mil_boxes = None
+        mil_scores = None
  
         if snap_center and kept_boxes.numel() > 0:
             kept_boxes = kept_boxes.clone()
@@ -325,6 +329,7 @@ def _build_point_pseudo_targets(teacher_outputs, targets, point_sup, use_focal_l
         density_global_min_wh_px = float(density_limit_cfg.get("global_min_wh_px", 6.0)) if isinstance(density_limit_cfg, dict) else 6.0
         density_use_input_hw = bool(density_limit_cfg.get("use_input_hw", True)) if isinstance(density_limit_cfg, dict) else True
 
+        dspe_mil_candidate = bool(dspe_cfg.get("mil_candidate", True))
         if density_limit_enabled and kept_boxes.numel() > 0:
             N = kept_pts.shape[0]
             px_w = float(w_img) if (density_use_input_hw and w_img > 0) else float(base_size)
@@ -354,12 +359,23 @@ def _build_point_pseudo_targets(teacher_outputs, targets, point_sup, use_focal_l
                 dynamic_max_wh_px = torch.min(dynamic_max_wh_px, global_max_wh)
             else:
                 dynamic_max_wh_px = torch.tensor([[density_global_max_wh_px, density_global_max_wh_px]], device=kept_pts.device)
+                knn_dist_px = torch.full((N,), float(density_global_max_wh_px), device=kept_pts.device, dtype=torch.float32)
 
             teacher_wh_px = kept_boxes[:, 2:].clone()
             teacher_wh_px[:, 0] *= px_w
             teacher_wh_px[:, 1] *= px_h
 
             b_vis_wh_px = teacher_wh_px
+            vis_wh_list = []
+            vis_score_list = []
+            taus = []
+            if fg_enabled:
+                if isinstance(fg_taus, (list, tuple)):
+                    taus = [float(x) for x in fg_taus if x is not None]
+                elif isinstance(fg_taus, (int, float)):
+                    taus = [float(fg_taus)]
+                if not taus:
+                    taus = [float(fg_tau)]
             if fg_enabled:
                 feat_all = teacher_outputs.get(fg_feat_key, None) if isinstance(teacher_outputs, dict) else None
                 if isinstance(feat_all, torch.Tensor) and feat_all.ndim == 4 and int(feat_all.shape[0]) > int(b):
@@ -374,22 +390,36 @@ def _build_point_pseudo_targets(teacher_outputs, targets, point_sup, use_focal_l
                     sim = torch.einsum("bchw,nc->bnhw", fmap_n, v_center)[0]
                     stride_w = px_w / float(fmap.shape[-1])
                     stride_h = px_h / float(fmap.shape[-2])
-                    out_wh = []
-                    for ii in range(int(sim.shape[0])):
-                        mask = sim[ii] > float(fg_tau)
-                        if bool(mask.any()):
-                            idx = torch.nonzero(mask, as_tuple=False)
-                            if int(idx.shape[0]) >= int(fg_min_mask_px):
-                                y0 = int(idx[:, 0].min().item())
-                                y1 = int(idx[:, 0].max().item())
-                                x0 = int(idx[:, 1].min().item())
-                                x1 = int(idx[:, 1].max().item())
-                                wv = max(1.0, float(x1 - x0 + 1) * float(stride_w))
-                                hv = max(1.0, float(y1 - y0 + 1) * float(stride_h))
-                                out_wh.append([wv, hv])
-                                continue
-                        out_wh.append([float(b_vis_wh_px[ii, 0].item()), float(b_vis_wh_px[ii, 1].item())])
-                    b_vis_wh_px = torch.as_tensor(out_wh, device=kept_pts.device, dtype=torch.float32)
+                    for tau in taus:
+                        out_wh = []
+                        out_sc = []
+                        for ii in range(int(sim.shape[0])):
+                            mask = sim[ii] > float(tau)
+                            if bool(mask.any()):
+                                idx = torch.nonzero(mask, as_tuple=False)
+                                if int(idx.shape[0]) >= int(fg_min_mask_px):
+                                    y0 = int(idx[:, 0].min().item())
+                                    y1 = int(idx[:, 0].max().item())
+                                    x0 = int(idx[:, 1].min().item())
+                                    x1 = int(idx[:, 1].max().item())
+                                    wv = max(1.0, float(x1 - x0 + 1) * float(stride_w))
+                                    hv = max(1.0, float(y1 - y0 + 1) * float(stride_h))
+                                    out_wh.append([wv, hv])
+                                    out_sc.append(float(sim[ii][mask].mean().item()))
+                                    continue
+                            out_wh.append([float(teacher_wh_px[ii, 0].item()), float(teacher_wh_px[ii, 1].item())])
+                            out_sc.append(-1e3)
+                        vis_wh_list.append(torch.as_tensor(out_wh, device=kept_pts.device, dtype=torch.float32))
+                        vis_score_list.append(torch.as_tensor(out_sc, device=kept_pts.device, dtype=torch.float32))
+                    if fg_tau in taus:
+                        idx_primary = taus.index(float(fg_tau))
+                    else:
+                        idx_primary = int(torch.argmin(torch.abs(torch.as_tensor(taus, device=kept_pts.device) - float(fg_tau))).item())
+                    b_vis_wh_px = vis_wh_list[idx_primary]
+                else:
+                    taus = []
+            else:
+                taus = []
 
             pseudo_wh_px = torch.min(b_vis_wh_px, dynamic_max_wh_px)
             global_min_wh = torch.tensor([density_global_min_wh_px, density_global_min_wh_px], device=kept_pts.device)
@@ -402,15 +432,30 @@ def _build_point_pseudo_targets(teacher_outputs, targets, point_sup, use_focal_l
             kept_boxes[:, 2:] = pseudo_wh_norm
             if kept_pts.numel() > 0:
                 cand_teacher = teacher_wh_px
-                cand_vis = b_vis_wh_px
                 cand_clip_teacher = torch.min(teacher_wh_px, dynamic_max_wh_px)
-                cands = torch.stack([cand_teacher, cand_vis, cand_clip_teacher], dim=1)
+                cand_list = [cand_teacher, cand_clip_teacher]
+                score_list = [kept_scores.detach().float(), (1.0 / (knn_dist_px.clamp(min=1.0) + 1.0)).detach().float()]
+                for wv, sv in zip(vis_wh_list, vis_score_list):
+                    cand_list.append(wv)
+                    score_list.append(sv.detach().float())
+                if dspe_enabled and num_classes > 0 and prior_wh_px is not None and dspe_mil_candidate:
+                    scale = torch.as_tensor([px_w / float(base_size), px_h / float(base_size)], device=kept_pts.device, dtype=torch.float32)
+                    dspe_wh = prior_wh_px[kept_labels.long()] * scale[None, :]
+                    dspe_wh = torch.clamp(dspe_wh, min=density_global_min_wh_px, max=density_global_max_wh_px)
+                    cand_list.append(dspe_wh)
+                    std = torch.sqrt(torch.clamp(var_logwh, min=1e-6))
+                    dspe_sc = -std[kept_labels.long()].sum(dim=1)
+                    dspe_sc = dspe_sc + float(min(float(epoch) / 30.0, 1.0))
+                    score_list.append(dspe_sc.detach().float())
+
+                cands = torch.stack(cand_list, dim=1)
                 cands = torch.clamp(cands, min=density_global_min_wh_px, max=density_global_max_wh_px)
                 cands_norm = cands.clone()
                 cands_norm[:, :, 0] /= px_w
                 cands_norm[:, :, 1] /= px_h
                 centers = kept_pts[:, None, :].repeat(1, cands_norm.shape[1], 1)
                 mil_boxes = torch.cat([centers, cands_norm], dim=2).clamp(min=0.0, max=1.0)
+                mil_scores = torch.stack(score_list, dim=1)
 
         if dspe_enabled and num_classes > 0 and kept_boxes.numel() > 0:
             dist_px = kept_dists * base_size
@@ -446,6 +491,8 @@ def _build_point_pseudo_targets(teacher_outputs, targets, point_sup, use_focal_l
         t_new["labels"] = kept_labels
         if mil_boxes is not None:
             t_new["mil_boxes"] = mil_boxes
+        if mil_scores is not None:
+            t_new["mil_scores"] = mil_scores
         pseudo_targets.append(t_new)
  
     if dspe_enabled and num_classes > 0 and sums is not None and counts is not None:

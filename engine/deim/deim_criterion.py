@@ -54,7 +54,8 @@ class DEIMCriterion(nn.Module):
         ccm_params=None,
         density_recall_penalty=1.1,     
         density_precision_penalty=1.3,
-        mask_point_sample_ratio=8
+        mask_point_sample_ratio=8,
+        mil_beta_score=10.0
         ):
         """Create the criterion.    
         Parameters: 
@@ -88,6 +89,7 @@ class DEIMCriterion(nn.Module):
         self.density_recall_penalty = density_recall_penalty
         self.density_precision_penalty = density_precision_penalty     
         self.mask_point_sample_ratio = mask_point_sample_ratio
+        self.mil_beta_score = float(mil_beta_score)
         self.model = None
         self._loss_config_logged = False
   
@@ -310,18 +312,27 @@ class DEIMCriterion(nn.Module):
         if src_boxes.numel() == 0:
             return {'loss_points_mil_reg': src_boxes.sum()}
         cand_list = []
+        score_list = []
         for t, (_, j) in zip(targets, indices):
             mb = t.get('mil_boxes', None)
+            ms = t.get('mil_scores', None)
             if not isinstance(mb, torch.Tensor) or mb.numel() == 0:
                 cand_list.append(None)
+                score_list.append(None)
             else:
                 cand_list.append(mb[j])
+                score_list.append(ms[j] if isinstance(ms, torch.Tensor) else None)
         if any(x is None for x in cand_list):
             return {'loss_points_mil_reg': src_boxes.sum() * 0.0}
         cand_boxes = torch.cat(cand_list, dim=0).to(src_boxes.device).float()
         if cand_boxes.ndim != 3 or cand_boxes.shape[0] != src_boxes.shape[0]:
             return {'loss_points_mil_reg': src_boxes.sum() * 0.0}
         m = int(cand_boxes.shape[1])
+        cand_scores = None
+        if not any(x is None for x in score_list):
+            cand_scores = torch.cat(score_list, dim=0).to(src_boxes.device).float()
+            if cand_scores.ndim != 2 or cand_scores.shape[0] != src_boxes.shape[0] or cand_scores.shape[1] != m:
+                cand_scores = None
         src_wh = src_boxes[:, 2:].clamp(min=1e-6)
         cand_wh = cand_boxes[:, :, 2:].clamp(min=1e-6)
         l1_wh = torch.abs(src_wh[:, None, :] - cand_wh).sum(dim=-1)
@@ -332,7 +343,11 @@ class DEIMCriterion(nn.Module):
         giou = bbox_iou_aligned_xyxy(src_xyxy, cand_xyxy, iou_type='giou')
         liou = (1.0 - giou).view(-1, m).clamp(min=0.0, max=2.0)
         total = l1_wh + liou
-        w = torch.softmax(-float(beta) * total, dim=1)
+        beta_score = float(getattr(self, 'mil_beta_score', beta))
+        if cand_scores is None:
+            w = torch.full_like(total, 1.0 / float(m))
+        else:
+            w = torch.softmax(beta_score * cand_scores.detach(), dim=1)
         loss = (w * total).sum(dim=1).sum() / num_boxes
         return {'loss_points_mil_reg': loss}
 
