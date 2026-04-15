@@ -11,16 +11,13 @@ import json
 import datetime
 import copy     
 import gc
-import inspect
-from pathlib import Path
 
 import torch    
 
 from ..misc import dist_utils, stats, get_weight_size     
 
 from ._solver import BaseSolver, ModelSaverFunc  
-from .det_engine import train_one_epoch, distill_one_epoch, evaluate, _ScaleMemoryBank     
-from .afss import AFSSController
+from .det_engine import train_one_epoch, distill_one_epoch, evaluate
 from .sample_adapter import move_samples_to_device, select_model_input, select_model_input_for_model
 from ..optim.lr_scheduler import FlatCosineLRScheduler 
 from ..logger_module import get_logger
@@ -36,9 +33,6 @@ class DetSolver(BaseSolver):
     def __init__(self, cfg):  
         super().__init__(cfg)     
         self.best_stat = self._default_best_stat()  
-        self.afss = None 
-        self.afss_update_dataloader = None 
-        self._pending_afss_state = None  
    
     @staticmethod
     def _default_best_stat():
@@ -50,11 +44,8 @@ class DetSolver(BaseSolver):
 
     def state_dict(self):
         state = super().state_dict()     
-        state.pop('afss', None)
         self._ensure_best_stat()
         state['best_stat'] = copy.deepcopy(self.best_stat)
-        if self.afss is not None:
-            state['afss_state'] = self.afss.state_dict() 
         return state 
 
     def load_state_dict(self, state):
@@ -64,11 +55,6 @@ class DetSolver(BaseSolver):
             self.best_stat = copy.deepcopy(loaded_best_stat)
         else:  
             self.best_stat = self._default_best_stat()
-        if 'afss_state' in state:  
-            if self.afss is not None:     
-                self.afss.load_state_dict(state['afss_state'])
-            else:  
-                self._pending_afss_state = copy.deepcopy(state['afss_state'])
 
     def _build_checkpoint_paths(self, epoch, checkpoint_freq):     
         if not self.output_dir:
@@ -113,265 +99,9 @@ class DetSolver(BaseSolver):
         for k, v in metrics.items():
             logger.info(f'  {k}: {v:.4f}') 
         logger.info(f'Initialized best_stat from resume eval: {self.best_stat}') 
-
-    def _build_afss(self):
-        afss_cfg = self.cfg.yaml_cfg.get('AFSS', {})
-        if not afss_cfg.get('enabled', False):  
-            return
-
-        if self.afss is None:     
-            controller_params = set(inspect.signature(AFSSController.__init__).parameters.keys()) - {'self'}  
-            controller_kwargs = {k: v for k, v in afss_cfg.items() if k in controller_params}
-            self.afss = AFSSController(**controller_kwargs)
-            total_samples = len(getattr(self.train_dataloader.dataset, 'base_dataset', self.train_dataloader.dataset))
-            self.afss.initialize_states(total_samples=total_samples)  
-
-        if self.afss_update_dataloader is None and 'afss_update_dataloader' in self.cfg.yaml_cfg:   
-            self.afss_update_dataloader = dist_utils.warp_loader(
-                self.cfg.build_dataloader('afss_update_dataloader'),  
-                shuffle=False,  
-            )
-    
-        self._restore_afss_state_if_needed()
-  
-    def _restore_afss_state_if_needed(self):
-        if self.afss is None:
-            return
-   
-        pending_state = getattr(self, '_pending_afss_state', None)
-        if pending_state is not None:     
-            self.afss.load_state_dict(pending_state)
-            self._pending_afss_state = None   
-            return   
-
-        resume_path = getattr(self.cfg, 'resume', None)     
-        if not resume_path:   
-            return     
-
-        if resume_path.startswith('http'):
-            state = torch.hub.load_state_dict_from_url(resume_path, map_location='cpu')
-        else: 
-            state = torch.load(resume_path, map_location='cpu', weights_only=False)   
-     
-        if 'afss_state' in state:
-            self.afss.load_state_dict(state['afss_state'])
-  
-    def _log_afss_active_subset(self, epoch, selected_indices):
-        logger.info( 
-            ORANGE
-            + f"[AFSS][Epoch {epoch}] active subset={len(selected_indices)}/{len(self.afss.states)}"
-            + RESET
-        ) 
-
-    def _log_afss_refresh_summary(self, epoch, before_counts, after_counts, selected_count):
-        logger.info( 
-            ORANGE
-            + (
-                f"[AFSS][Epoch {epoch}] refresh complete | " 
-                f"selected={selected_count} | "     
-                f"easy {before_counts['easy']} -> {after_counts['easy']} | "    
-                f"moderate {before_counts['moderate']} -> {after_counts['moderate']} | "
-                f"hard {before_counts['hard']} -> {after_counts['hard']}"
-            )    
-            + RESET
-        )     
-
-    def _should_dump_afss_refresh_json(self):     
-        cfg = getattr(self, 'cfg', None)
-        afss_cfg = getattr(cfg, 'yaml_cfg', {}).get('AFSS', {}) if cfg is not None else {}
-        return bool(afss_cfg.get('dump_refresh_json', False))     
-
-    def _resolve_afss_base_dataset(self):
-        dataset = getattr(self.train_dataloader, 'dataset', None)   
-        visited = set()
-        while dataset is not None and id(dataset) not in visited:
-            visited.add(id(dataset))   
-            if hasattr(dataset, 'base_dataset'):
-                dataset = dataset.base_dataset
-                continue 
-            if hasattr(dataset, 'dataset'):  
-                dataset = dataset.dataset     
-                continue
-            break
-        return dataset
-
-    def _resolve_afss_image_path(self, idx):
-        dataset = self._resolve_afss_base_dataset()
-        if dataset is None:
-            return None    
-   
-        try:   
-            image_id = dataset.ids[int(idx)]    
-            image_info = dataset.coco.loadImgs(image_id)[0]
-            file_name = image_info.get('file_name', None)
-            if file_name is None:
-                return None 
-            if file_name.startswith('/'):
-                return file_name
-            img_folder = getattr(dataset, 'img_folder', None) or getattr(dataset, 'root', None)
-            if img_folder is None:  
-                return file_name
-            return str((Path(img_folder) / file_name).resolve())
-        except Exception:     
-            return None    
-
-    def _build_afss_refresh_payload(self, epoch, after_counts):   
-        preview_indices = self.afss.select_indices_for_epoch(epoch + 1)
-        active_images = [] 
-        for idx in preview_indices:
-            image_path = self._resolve_afss_image_path(idx)
-            if image_path is not None:
-                active_images.append(image_path)
-
-        image_entries = []
-        for idx, state in self.afss.states.items():
-            metrics = {
-                'box': {   
-                    'precision': float(state['box_precision']),
-                    'recall': float(state['box_recall']),
-                }  
-            }   
-            if state.get('has_mask_metrics', False):
-                metrics['mask'] = {
-                    'precision': float(state['mask_precision']),   
-                    'recall': float(state['mask_recall']),    
-                }
-
-            image_entries.append(
-                {
-                    'im_file': self._resolve_afss_image_path(idx), 
-                    'last_eval_epoch': int(state.get('last_eval_epoch', -1)),
-                    'last_used_epoch': int(state.get('last_used_epoch', -1)),
-                    'level': self.afss.level_for_index(idx),
-                    'metrics': metrics,   
-                    'task_score': float(state.get('score', state.get('precision', 0.0))),     
-                }     
-            )  
-
-        image_entries.sort(key=lambda item: (item['task_score'], item['im_file'] or ''))
- 
-        return {
-            'active_count': len(preview_indices),    
-            'active_images': active_images,
-            'counts': {k: int(v) for k, v in after_counts.items()},   
-            'epoch': int(epoch),
-            'images': image_entries,
-            'thresholds': {  
-                'easy': float(self.afss.easy_threshold), 
-                'moderate': float(self.afss.moderate_threshold),
-            },
-        }
-    
-    def _dump_afss_refresh_json(self, epoch, after_counts):    
-        if not self._should_dump_afss_refresh_json(): 
-            return   
-        if not self.output_dir or not dist_utils.is_main_process():
-            return
-     
-        afss_dir = self.output_dir / 'afss' 
-        afss_dir.mkdir(parents=True, exist_ok=True)  
-        payload = self._build_afss_refresh_payload(epoch, after_counts)
-        json_path = afss_dir / f'refresh_epoch{epoch:04d}.json'   
-        with json_path.open('w') as f:
-            json.dump(payload, f, indent=2)  
-  
-    @staticmethod 
-    def _flatten_afss_updates(gathered_updates):
-        merged = []
-        for updates in gathered_updates:  
-            merged.extend(updates)
-        return merged    
-
-    @torch.no_grad()
-    def _refresh_afss_scores(self, epoch):   
-        if self.afss is None or self.afss_update_dataloader is None: 
-            return
- 
-        module = self.ema.module if self.ema else self.model  
-        was_training = module.training
-        module.eval()
-
-        before_counts = self.afss.level_counts()
-        self.afss_update_dataloader.set_epoch(epoch)     
-        if hasattr(self.afss_update_dataloader.sampler, 'set_epoch'):
-            self.afss_update_dataloader.sampler.set_epoch(epoch)    
-
-        local_updates = []
-        for samples, targets in self.afss_update_dataloader:    
-            samples = move_samples_to_device(samples, self.device, non_blocking=True)
-            size_source = select_model_input(samples, key='rgb')
-            model_inputs = select_model_input_for_model(samples, model=module, key='rgb')     
-            targets = [{k: v.to(self.device, non_blocking=True) for k, v in t.items()} for t in targets]
-            outputs = module(model_inputs) 
-            current_sizes = torch.stack(
-                [
-                    torch.tensor([size_source.shape[-1], size_source.shape[-2]], device=self.device)
-                    for _ in targets
-                ],
-                dim=0,    
-            )
-            results = self.postprocessor(outputs, current_sizes, for_eval=True)  
-            for target, result in zip(targets, results): 
-                idx = int(target['idx'].item())  
-                box_precision, box_recall = self.afss.compute_image_precision_recall(     
-                    result,   
-                    target,    
-                    self.afss.iou_threshold, 
-                    self.afss.conf_threshold,
-                )
-                mask_precision, mask_recall = self.afss.compute_image_mask_precision_recall(
-                    result,    
-                    target,   
-                    self.afss.iou_threshold,     
-                    self.afss.conf_threshold,    
-                )   
-                local_updates.append((idx, box_precision, box_recall, mask_precision, mask_recall))
-
-        merged_updates = local_updates
-        if dist_utils.is_dist_available_and_initialized(): 
-            merged_updates = self._flatten_afss_updates(dist_utils.all_gather(local_updates))     
-     
-        for idx, box_precision, box_recall, mask_precision, mask_recall in merged_updates:
-            self.afss.update_image_metrics(  
-                idx,
-                box_precision=box_precision,    
-                box_recall=box_recall, 
-                mask_precision=mask_precision,  
-                mask_recall=mask_recall,   
-                eval_epoch=epoch,     
-            )    
-
-        after_counts = self.afss.level_counts()
-        self._dump_afss_refresh_json(epoch, after_counts)    
-        selected_count = len(getattr(self.train_dataloader.dataset, 'active_indices', [])) or len(self.train_dataloader.dataset)
-        self._log_afss_refresh_summary(epoch, before_counts, after_counts, selected_count)
-
-        if was_training:
-            module.train()     
-   
     def fit(self, cfg_str):
         self.train()    
-        self._build_afss()     
         args = self.cfg   
-        point_sup = self.cfg.yaml_cfg.get("PointSupervision", None)
-        point_sup_state = None
-        if isinstance(point_sup, dict) and point_sup.get("enabled", False):
-            dspe_cfg = point_sup.get("DSPE", None) or point_sup.get("dspe", None) or {}
-            if isinstance(dspe_cfg, dict) and dspe_cfg.get("enabled", False):
-                num_classes = int(self.cfg.yaml_cfg.get("num_classes", 0))
-                init_mean = dspe_cfg.get("init_mean_wh_px", (12.0, 12.0))
-                init_std = dspe_cfg.get("init_std_wh_px", (6.0, 6.0))
-                min_std = dspe_cfg.get("min_std_px", (0.35, 0.35))
-                bank = _ScaleMemoryBank(num_classes=num_classes, init_mean_wh_px=init_mean, init_std_wh_px=init_std, min_std_px=min_std)
-                point_sup_state = {"scale_bank": bank, "num_classes": num_classes}
-        if isinstance(point_sup, dict) and point_sup.get("enabled", False):
-            module = dist_utils.de_parallel(self.model)
-            for m in module.modules():
-                if hasattr(m, "num_denoising"):
-                    try:
-                        setattr(m, "num_denoising", 0)
-                    except Exception:
-                        pass
 
         if dist_utils.is_main_process():     
             with open(self.output_dir / 'args.json', 'w') as json_file:
@@ -419,11 +149,6 @@ class DetSolver(BaseSolver):
 
             self.train_dataloader.set_epoch(epoch)   
             self.criterion.set_epoch(epoch)  
-            if self.afss is not None:
-                selected_indices = self.afss.select_indices_for_epoch(epoch)     
-                self.train_dataloader.dataset.set_active_indices(selected_indices)
-                self.afss.mark_selected_indices(selected_indices, epoch)
-                self._log_afss_active_subset(epoch, selected_indices)
 
             if hasattr(self.train_dataloader.sampler, 'set_epoch'):    
                 self.train_dataloader.sampler.set_epoch(epoch)
@@ -455,18 +180,12 @@ class DetSolver(BaseSolver):
                 output_dir=self.output_dir,
                 epoches=args.epoches, # 总的训练次数
                 verbose_type=args.verbose_type,
-                point_sup=point_sup,
-                point_sup_state=point_sup_state,
-                use_focal_loss=getattr(self.cfg, "use_focal_loss", True),
             )
 
             if torch.cuda.is_available():     
                 torch.cuda.empty_cache()
                 gc.collect() 
  
-            if self.afss is not None and self.afss.should_refresh_scores(epoch):  
-                self._refresh_afss_scores(epoch)  
-
             if not self.self_lr_scheduler:  # update by epoch 
                 if self.lr_warmup_scheduler is None or self.lr_warmup_scheduler.finished():    
                     self.lr_scheduler.step()    

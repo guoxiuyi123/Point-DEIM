@@ -1,0 +1,12 @@
+__include__: [
+  '../dfine/dfine_hgnetv2_n_custom.yml',
+  '../dataset/visdrone_detection.yml',
+  '../base/deim.yml'
+]
+
+print_freq: 20
+output_dir: ./outputs/deimv1_hgnetv2_n_visdrone_fullsup
+
+model: DEIM
+
+use_ema: False

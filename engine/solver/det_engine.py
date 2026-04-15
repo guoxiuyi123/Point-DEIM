@@ -15,7 +15,6 @@ import numpy as np
 from typing import Iterable
 from tqdm import tqdm
 from tidecv import TIDE, datasets
-from scipy.optimize import linear_sum_assignment
 
 import torch    
 import torch.amp
@@ -44,322 +43,6 @@ TIME_DEBUG = False
 RED, GREEN, BLUE, YELLOW, ORANGE, RESET = "\033[91m", "\033[92m", "\033[94m", "\033[93m", "\033[38;5;208m", "\033[0m"
 logger = get_logger(__name__)
 
- 
-def _is_point_supervision_enabled(point_sup):
-    return isinstance(point_sup, dict) and point_sup.get("enabled", False)
- 
- 
-def _safe_sigmoid_probs(logits: torch.Tensor) -> torch.Tensor:
-    return logits.float().sigmoid()
- 
- 
-def _safe_softmax_probs(logits: torch.Tensor) -> torch.Tensor:
-    return logits.float().softmax(-1)
- 
- 
-def _get_teacher_layer_boxes(teacher_outputs):
-    layers = []
-    if isinstance(teacher_outputs, dict) and "pred_boxes" in teacher_outputs:
-        layers.append(teacher_outputs["pred_boxes"])
-    aux = teacher_outputs.get("aux_outputs", None) if isinstance(teacher_outputs, dict) else None
-    if isinstance(aux, (list, tuple)):
-        for o in aux:
-            if isinstance(o, dict) and "pred_boxes" in o:
-                layers.append(o["pred_boxes"])
-    return layers
- 
- 
-def _query_logwh_stability_px(teacher_outputs, base_size: float, batch_index: int, query_indices: torch.Tensor):
-    layers = _get_teacher_layer_boxes(teacher_outputs)
-    if len(layers) <= 1:
-        return torch.zeros((query_indices.numel(),), device=query_indices.device, dtype=torch.float32)
-    logs = []
-    for boxes in layers:
-        b = boxes.detach()[batch_index].float()
-        wh = b[query_indices][:, 2:].clamp(min=1e-6)
-        logwh_px = torch.log(torch.clamp(wh * float(base_size), min=1.0))
-        logs.append(logwh_px)
-    stack = torch.stack(logs, dim=0)
-    mean = stack.mean(dim=0)
-    dev = (stack - mean).abs().mean(dim=0)
-    return dev.mean(dim=1)
- 
- 
-def _extract_hw_from_model_inputs(model_inputs):
-    if torch.is_tensor(model_inputs):
-        return int(model_inputs.shape[-2]), int(model_inputs.shape[-1])
-    if isinstance(model_inputs, dict):
-        for v in model_inputs.values():
-            if torch.is_tensor(v):
-                return int(v.shape[-2]), int(v.shape[-1])
-    raise ValueError("Cannot infer H,W from model_inputs")
- 
- 
-class _ScaleMemoryBank:
-    def __init__(self, num_classes: int, init_mean_wh_px=(12.0, 12.0), init_std_wh_px=(1.0, 1.0), min_std_px=(0.35, 0.35)):
-        self.num_classes = int(num_classes)
-        mean = torch.tensor(init_mean_wh_px, dtype=torch.float32).log()
-        std = torch.tensor(init_std_wh_px, dtype=torch.float32)
-        self.mu = mean.repeat(self.num_classes, 1).clone()
-        self.var = (std**2).repeat(self.num_classes, 1).clone()
-        self.min_std = torch.tensor(min_std_px, dtype=torch.float32)
-        self.steps = 0
- 
-    def get_stats(self, device=None):
-        if device is None:
-            return self.mu, self.var
-        return self.mu.to(device), self.var.to(device)
- 
-    def update_from_moments(self, mean_logwh: torch.Tensor, var_logwh: torch.Tensor, count: torch.Tensor, beta: float):
-        beta = float(beta)
-        if beta <= 0:
-            return
-        valid = count > 0
-        if not torch.any(valid):
-            return
-        mean_logwh = mean_logwh.to(self.mu.device)
-        var_logwh = var_logwh.to(self.var.device)
-        valid_idx = valid.nonzero(as_tuple=False).squeeze(1)
-        self.mu[valid_idx] = (1 - beta) * self.mu[valid_idx] + beta * mean_logwh[valid_idx]
-        self.var[valid_idx] = (1 - beta) * self.var[valid_idx] + beta * var_logwh[valid_idx]
-        std = torch.sqrt(torch.clamp(self.var, min=1e-6))
-        std = torch.maximum(std, self.min_std[None, :])
-        self.var = std**2
-        self.steps += 1
- 
- 
-def _sample_logwh_from_bank(bank: _ScaleMemoryBank, class_id: int, k: int, explore_ratio: float, explore_wh_px, device):
-    mu, var = bank.get_stats(device=device)
-    cid = int(class_id)
-    k = int(k)
-    explore_ratio = float(explore_ratio)
-    k_explore = int(round(k * explore_ratio))
-    k_exploit = max(0, k - k_explore)
- 
-    parts = []
-    if k_exploit > 0:
-        eps = torch.randn((k_exploit, 2), device=device)
-        std = torch.sqrt(torch.clamp(var[cid], min=1e-6))
-        parts.append(mu[cid][None, :] + eps * std[None, :])
-    if k_explore > 0:
-        explore_wh_px = torch.as_tensor(explore_wh_px, device=device, dtype=torch.float32)
-        if explore_wh_px.ndim == 1:
-            explore_wh_px = explore_wh_px[:, None].repeat(1, 2)
-        idx = torch.randint(0, explore_wh_px.shape[0], (k_explore,), device=device)
-        parts.append(torch.log(torch.clamp(explore_wh_px[idx], min=1.0)))
-    if not parts:
-        return mu[cid][None, :].repeat(k, 1)
-    return torch.cat(parts, dim=0)
- 
- 
-def _build_point_pseudo_targets(teacher_outputs, targets, point_sup, use_focal_loss: bool, model_inputs=None, point_sup_state=None, writer: SummaryWriter = None, global_step: int = 0, epoch: int = 0):
-    pred_boxes = teacher_outputs["pred_boxes"].detach()
-    pred_logits = teacher_outputs["pred_logits"].detach()
-    w_point = float(point_sup.get("cost_point", 1.0))
-    w_class = float(point_sup.get("cost_class", 2.0))
-    w_prior = float(point_sup.get("cost_prior", 0.0))
-    score_thresh = float(point_sup.get("score_thresh", 0.2))
-    max_l1_dist = float(point_sup.get("max_l1_dist", 1.0))
-    snap_center = bool(point_sup.get("snap_center", True))
-    keep_all_points = bool(point_sup.get("keep_all_points", True))
-    dspe_cfg = point_sup.get("DSPE", None) or point_sup.get("dspe", None) or {}
-    dspe_enabled = isinstance(dspe_cfg, dict) and dspe_cfg.get("enabled", False) and point_sup_state is not None and point_sup_state.get("scale_bank", None) is not None
-    base_size = float(dspe_cfg.get("base_size", 640.0))
-    bag_size = int(dspe_cfg.get("bag_size", 16))
-    explore_ratio = float(dspe_cfg.get("explore_ratio", 0.25))
-    explore_wh_px = dspe_cfg.get("explore_wh_px", [4, 6, 8, 10, 12, 16, 20, 24, 32, 40, 48, 64])
-    update_top_frac = float(dspe_cfg.get("update_top_frac", 0.10))
-    update_beta = float(dspe_cfg.get("update_beta", 0.02))
-    update_score_thresh = float(dspe_cfg.get("update_score_thresh", max(score_thresh, 0.3)))
-    update_max_dist_px = float(dspe_cfg.get("update_max_dist_px", 32.0))
-    large_box_area_ratio_thresh = float(dspe_cfg.get("large_box_area_ratio_thresh", 2.0))
-    large_box_area_penalty = float(dspe_cfg.get("large_box_area_penalty", 5.0))
-    update_max_area_ratio = float(dspe_cfg.get("update_max_area_ratio", 6.0))
-    update_stab_thresh = float(dspe_cfg.get("update_stab_thresh", 1e9))
-    pseudo_prior_mix = float(dspe_cfg.get("pseudo_prior_mix", 0.0))
-    pseudo_prior_mix_schedule = dspe_cfg.get("pseudo_prior_mix_schedule", None)
-    pseudo_min_wh_px = float(dspe_cfg.get("pseudo_min_wh_px", 2.0))
-    pseudo_max_wh_px = float(dspe_cfg.get("pseudo_max_wh_px", 128.0))
-    wh_select_k = int(dspe_cfg.get("wh_select_k", bag_size))
-    bag_aspect_ratios = dspe_cfg.get("bag_aspect_ratios", [0.5, 1.0, 2.0])
-    bag_wh_weight = float(dspe_cfg.get("bag_wh_weight", 1.0))
-    bag_stab_weight = float(dspe_cfg.get("bag_stab_weight", 0.0))
- 
-    mix = pseudo_prior_mix
-    if isinstance(pseudo_prior_mix_schedule, (list, tuple)) and pseudo_prior_mix_schedule:
-        try:
-            for item in pseudo_prior_mix_schedule:
-                if not isinstance(item, (list, tuple)) or len(item) != 2:
-                    continue
-                start_epoch, value = int(item[0]), float(item[1])
-                if int(epoch) >= start_epoch:
-                    mix = value
-        except Exception:
-            mix = pseudo_prior_mix
- 
-    if model_inputs is not None:
-        h_img, w_img = _extract_hw_from_model_inputs(model_inputs)
-    else:
-        h_img, w_img = 0, 0
- 
-    probs = _safe_sigmoid_probs(pred_logits) if use_focal_loss else _safe_softmax_probs(pred_logits)
- 
-    pseudo_targets = []
-    bs = pred_boxes.shape[0]
-    total_gt_points = torch.zeros((), dtype=torch.float32, device=pred_boxes.device)
-    total_pseudo = torch.zeros((), dtype=torch.float32, device=pred_boxes.device)
-    sums = None
-    sums_sq = None
-    counts = None
-    bank = point_sup_state.get("scale_bank", None) if dspe_enabled else None
-    num_classes = int(dspe_cfg.get("num_classes", point_sup_state.get("num_classes", 0) or 0))
-    if dspe_enabled and num_classes > 0:
-        sums = torch.zeros((num_classes, 2), dtype=torch.float32, device=pred_boxes.device)
-        sums_sq = torch.zeros((num_classes, 2), dtype=torch.float32, device=pred_boxes.device)
-        counts = torch.zeros((num_classes,), dtype=torch.float32, device=pred_boxes.device)
-        mu_logwh, _ = bank.get_stats(device=pred_boxes.device)
-        prior_wh_px = torch.clamp(mu_logwh.exp(), min=1.0)
-        prior_wh_px = torch.clamp(prior_wh_px, min=pseudo_min_wh_px, max=pseudo_max_wh_px)
-        prior_wh_norm = prior_wh_px / base_size
-        prior_area_px = (prior_wh_px[:, 0] * prior_wh_px[:, 1]).clamp(min=1.0)
-    else:
-        prior_wh_norm = None
-        prior_area_px = None
- 
-    for b in range(bs):
-        t = targets[b]
-        pts = t["boxes"][..., :2].detach().float()
-        labs = t["labels"].detach()
-        total_gt_points += float(labs.numel())
- 
-        if pts.numel() == 0:
-            t_new = dict(t)
-            t_new["boxes"] = t["boxes"].new_zeros((0, 4)).float()
-            t_new["labels"] = t["labels"].new_zeros((0,), dtype=torch.long)
-            pseudo_targets.append(t_new)
-            continue
- 
-        bboxes = pred_boxes[b].float()
-        bboxes = torch.nan_to_num(bboxes, nan=0.5, posinf=0.5, neginf=0.5)
-        bboxes[:, :2] = bboxes[:, :2].clamp(0.0, 1.0)
-        bboxes[:, 2:] = bboxes[:, 2:].clamp(1e-6, 1.0)
-        prob = probs[b]
-        cls_score = prob[:, labs]
-        cost_cls = -cls_score
-        cost_pt = torch.cdist(bboxes[:, :2], pts, p=1)
-        if dspe_enabled and w_prior > 0 and num_classes > 0:
-            wh_q_px = torch.clamp(bboxes[:, 2:] * base_size, min=pseudo_min_wh_px, max=pseudo_max_wh_px)
-            logwh_q_px = torch.log(torch.clamp(wh_q_px, min=1.0))
-            prior_cost_cols = []
-            area_q_px = (wh_q_px[:, 0] * wh_q_px[:, 1]).clamp(min=1.0)
-            for lab in labs.tolist():
-                mu_c = mu_logwh[int(lab)][None, :]
-                prior_cost_col = torch.cdist(logwh_q_px, mu_c, p=1).squeeze(1)
-                if prior_area_px is not None and large_box_area_penalty > 0:
-                    ratio = area_q_px / prior_area_px[int(lab)]
-                    extra = torch.relu(ratio - large_box_area_ratio_thresh) * large_box_area_penalty
-                    prior_cost_col = prior_cost_col + extra
-                prior_cost_cols.append(prior_cost_col)
-            prior_cost = torch.stack(prior_cost_cols, dim=1)
-            C = w_point * cost_pt + w_class * cost_cls + w_prior * prior_cost
-        else:
-            C = w_point * cost_pt + w_class * cost_cls
-        C = torch.nan_to_num(C, nan=1e6, posinf=1e6, neginf=1e6)
-        row_ind, col_ind = linear_sum_assignment(C.cpu().numpy())
-        row_ind = torch.as_tensor(row_ind, dtype=torch.long, device=C.device)
-        col_ind = torch.as_tensor(col_ind, dtype=torch.long, device=C.device)
- 
-        selected_boxes = bboxes[row_ind]
-        selected_labels = labs[col_ind]
-        selected_pts = pts[col_ind]
-        selected_scores = cls_score[row_ind, col_ind]
-        selected_dists = cost_pt[row_ind, col_ind]
-        selected_stab = _query_logwh_stability_px(teacher_outputs, base_size=base_size, batch_index=b, query_indices=row_ind)
- 
-        keep = (selected_scores >= score_thresh) & (selected_dists <= max_l1_dist)
-        if keep_all_points:
-            keep = torch.ones_like(keep, dtype=torch.bool)
-        elif not torch.any(keep):
-            best = torch.argmax(selected_scores - selected_dists)
-            keep = torch.zeros_like(keep, dtype=torch.bool)
-            keep[best] = True
- 
-        kept_boxes = selected_boxes[keep]
-        kept_labels = selected_labels[keep]
-        kept_pts = selected_pts[keep]
-        kept_scores = selected_scores[keep]
-        kept_dists = selected_dists[keep]
-        kept_stab = selected_stab[keep]
-        total_pseudo += float(kept_labels.numel())
- 
-        if snap_center and kept_boxes.numel() > 0:
-            kept_boxes = kept_boxes.clone()
-            kept_boxes[:, :2] = kept_pts
- 
-        if dspe_enabled and num_classes > 0 and kept_boxes.numel() > 0:
-            dist_px = kept_dists * base_size
-            upd_wh_px = torch.clamp(kept_boxes[:, 2:].clamp(min=1e-6) * base_size, min=pseudo_min_wh_px, max=pseudo_max_wh_px)
-            upd_area_px = (upd_wh_px[:, 0] * upd_wh_px[:, 1]).clamp(min=1.0)
-            if prior_area_px is not None:
-                ratio = upd_area_px / prior_area_px[kept_labels.long()]
-                ratio_ok = ratio <= update_max_area_ratio
-            else:
-                ratio_ok = torch.ones_like(upd_area_px, dtype=torch.bool)
-            update_mask = (kept_scores >= update_score_thresh) & (dist_px <= update_max_dist_px) & ratio_ok & (kept_stab <= update_stab_thresh)
-            if torch.any(update_mask):
-                upd_lab = kept_labels[update_mask]
-                upd_scores = kept_scores[update_mask]
-                upd_wh = kept_boxes[update_mask][:, 2:].clamp(min=1e-6)
-                wh_px = torch.clamp(upd_wh * base_size, min=pseudo_min_wh_px, max=pseudo_max_wh_px)
-                z = torch.log(torch.clamp(wh_px, min=1.0))
-                for c in upd_lab.unique().tolist():
-                    m = upd_lab == c
-                    zc = z[m]
-                    sc = upd_scores[m]
-                    if zc.numel() == 0:
-                        continue
-                    k_keep = max(1, int(round(float(sc.numel()) * update_top_frac)))
-                    topk = torch.topk(sc, k=min(k_keep, sc.numel()), largest=True).indices
-                    zt = zc[topk]
-                    sums[c] += zt.sum(dim=0)
-                    sums_sq[c] += (zt**2).sum(dim=0)
-                    counts[c] += float(zt.shape[0])
- 
-        t_new = dict(t)
-        t_new["boxes"] = kept_boxes
-        t_new["labels"] = kept_labels
-        pseudo_targets.append(t_new)
- 
-    if dspe_enabled and num_classes > 0 and sums is not None and counts is not None:
-        if dist_utils.is_dist_available_and_initialized():
-            torch.distributed.all_reduce(sums, op=torch.distributed.ReduceOp.SUM)
-            torch.distributed.all_reduce(sums_sq, op=torch.distributed.ReduceOp.SUM)
-            torch.distributed.all_reduce(counts, op=torch.distributed.ReduceOp.SUM)
-            torch.distributed.all_reduce(total_gt_points, op=torch.distributed.ReduceOp.SUM)
-            torch.distributed.all_reduce(total_pseudo, op=torch.distributed.ReduceOp.SUM)
-        mean = torch.zeros_like(sums)
-        var = torch.zeros_like(sums)
-        nonzero = counts > 0
-        if torch.any(nonzero):
-            mean[nonzero] = sums[nonzero] / counts[nonzero, None]
-            var[nonzero] = sums_sq[nonzero] / counts[nonzero, None] - mean[nonzero] ** 2
-            var = torch.clamp(var, min=1e-6)
-        bank.update_from_moments(mean.detach().cpu(), var.detach().cpu(), counts.detach().cpu(), beta=update_beta)
-        if writer is not None and dist_utils.is_main_process() and global_step % int(dspe_cfg.get("log_interval", 200)) == 0:
-            mu_cpu, var_cpu = bank.get_stats()
-            std_cpu = torch.sqrt(torch.clamp(var_cpu, min=1e-6))
-            for c in range(min(num_classes, 50)):
-                writer.add_scalar(f"DSPE/mu_w_px_cls_{c}", float(mu_cpu[c, 0].exp().item()), global_step)
-                writer.add_scalar(f"DSPE/mu_h_px_cls_{c}", float(mu_cpu[c, 1].exp().item()), global_step)
-                writer.add_scalar(f"DSPE/std_w_cls_{c}", float(std_cpu[c, 0].item()), global_step)
-                writer.add_scalar(f"DSPE/std_h_cls_{c}", float(std_cpu[c, 1].item()), global_step)
-            writer.add_scalar("DSPE/total_updates", float(bank.steps), global_step)
-            writer.add_scalar("PointSup/gt_points_per_iter", float(total_gt_points.item()), global_step)
-            writer.add_scalar("PointSup/pseudo_boxes_per_iter", float(total_pseudo.item()), global_step)
- 
-    return pseudo_targets
- 
- 
 def _plot_training_modalities(samples, targets, data_loader, output_dir, epoch):    
     modality_samples = select_plot_samples_for_logging(samples, keys=("rgb", "npy"))
     is_multimodal_plot = len(modality_samples) > 1
@@ -403,9 +86,6 @@ def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, cri
     output_dir = kwargs.get('output_dir', None)  
     epoches = kwargs.get('epoches', -1) # 总的训练次数    
     verbose_type = kwargs.get('verbose_type', 'origin') # 显示方式  
-    point_sup = kwargs.get("point_sup", None)
-    point_sup_state = kwargs.get("point_sup_state", None)
-    use_focal_loss = bool(kwargs.get("use_focal_loss", True))
     header = 'Epoch: {}/{}'.format(epoch, epoches)  # 训练过程的日志标题
      
     cur_iters = epoch * len(data_loader)  # 计算当前 epoch 的起始迭代数
@@ -444,24 +124,7 @@ def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, cri
         if scaler is not None:    
             with dt[1]:  
                 with torch.autocast(device_type=str(device), cache_enabled=True):     
-                    targets_for_train = targets
-                    if _is_point_supervision_enabled(point_sup):
-                        if ema is None:
-                            raise RuntimeError("PointSupervision requires EMA teacher. Set use_ema=True.")
-                        with torch.no_grad():
-                            teacher_outputs = ema.module(model_inputs, targets=None)
-                        targets_for_train = _build_point_pseudo_targets(
-                            teacher_outputs,
-                            targets,
-                            point_sup=point_sup,
-                            use_focal_loss=use_focal_loss,
-                            model_inputs=model_inputs,
-                            point_sup_state=point_sup_state,
-                            writer=writer,
-                            global_step=global_step,
-                            epoch=epoch,
-                        )
-                    outputs = model(model_inputs, targets=targets_for_train)     
+                    outputs = model(model_inputs, targets=targets)     
  
             # 处理异常情况，避免 NaN 或 Inf 影响训练 
             if torch.isnan(outputs['pred_boxes']).any() or torch.isinf(outputs['pred_boxes']).any():
@@ -478,7 +141,7 @@ def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, cri
             with dt[2]:
             # 计算损失
                 with torch.autocast(device_type=str(device), enabled=False):
-                    loss_dict = criterion(outputs, targets_for_train, **metas)
+                    loss_dict = criterion(outputs, targets, **metas)
                 loss = sum(loss_dict.values())  # 总损失  
             
             with dt[3]:    
@@ -495,26 +158,9 @@ def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, cri
         
         else:    
             with dt[1]:
-                targets_for_train = targets
-                if _is_point_supervision_enabled(point_sup):
-                    if ema is None:
-                        raise RuntimeError("PointSupervision requires EMA teacher. Set use_ema=True.")
-                    with torch.no_grad():
-                        teacher_outputs = ema.module(model_inputs, targets=None)
-                    targets_for_train = _build_point_pseudo_targets(
-                        teacher_outputs,
-                        targets,
-                        point_sup=point_sup,
-                        use_focal_loss=use_focal_loss,
-                        model_inputs=model_inputs,
-                        point_sup_state=point_sup_state,
-                        writer=writer,
-                        global_step=global_step,
-                        epoch=epoch,
-                    )
-                outputs = model(model_inputs, targets=targets_for_train)  # 前向传播     
+                outputs = model(model_inputs, targets=targets)  # 前向传播     
             with dt[2]: 
-                loss_dict = criterion(outputs, targets_for_train, **metas)  # 计算损失   
+                loss_dict = criterion(outputs, targets, **metas)  # 计算损失   
                 loss: torch.Tensor = sum(loss_dict.values())  # 总损失
             with dt[3]:
                 optimizer.zero_grad()  # 清空梯度    
