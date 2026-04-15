@@ -353,7 +353,14 @@ class DetSolver(BaseSolver):
         self.train()    
         self._build_afss()     
         args = self.cfg   
+        point_teacher = self.cfg.yaml_cfg.get("PointTeacher", None)
+        point_teacher_enabled = isinstance(point_teacher, dict) and point_teacher.get("enabled", False)
         point_sup = self.cfg.yaml_cfg.get("PointSupervision", None)
+        if point_teacher_enabled:
+            if not isinstance(point_sup, dict):
+                point_sup = {}
+            point_sup = dict(point_sup)
+            point_sup["enabled"] = True
         point_sup_state = None
         if isinstance(point_sup, dict) and point_sup.get("enabled", False):
             dspe_cfg = point_sup.get("DSPE", None) or point_sup.get("dspe", None) or {}
@@ -372,6 +379,8 @@ class DetSolver(BaseSolver):
                         setattr(m, "num_denoising", 0)
                     except Exception:
                         pass
+        if point_teacher_enabled and self.ema is None:
+            raise RuntimeError("PointTeacher requires EMA teacher. Set use_ema=True.")
 
         if dist_utils.is_main_process():     
             with open(self.output_dir / 'args.json', 'w') as json_file:
@@ -457,6 +466,7 @@ class DetSolver(BaseSolver):
                 verbose_type=args.verbose_type,
                 point_sup=point_sup,
                 point_sup_state=point_sup_state,
+                point_teacher=point_teacher,
                 use_focal_loss=getattr(self.cfg, "use_focal_loss", True),
             )
 

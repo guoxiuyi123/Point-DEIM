@@ -107,6 +107,204 @@ def _extract_hw_from_model_inputs(model_inputs):
             if torch.is_tensor(v):
                 return int(v.shape[-2]), int(v.shape[-1])
     raise ValueError("Cannot infer H,W from model_inputs")
+
+
+def _is_point_teacher_enabled(point_teacher):
+    return isinstance(point_teacher, dict) and point_teacher.get("enabled", False)
+
+
+def _random_block_mask(model_inputs, mask_cfg):
+    if not torch.is_tensor(model_inputs):
+        return model_inputs
+    if not isinstance(mask_cfg, dict) or not mask_cfg.get("enabled", False):
+        return model_inputs
+    prob = float(mask_cfg.get("prob", 0.0))
+    if prob <= 0:
+        return model_inputs
+    num_blocks = int(mask_cfg.get("num_blocks", 1))
+    min_ratio = float(mask_cfg.get("min_ratio", 0.05))
+    max_ratio = float(mask_cfg.get("max_ratio", 0.2))
+    fill = float(mask_cfg.get("fill", 0.0))
+    if num_blocks <= 0 or max_ratio <= 0:
+        return model_inputs
+    b, c, h, w = model_inputs.shape
+    out = model_inputs.clone()
+    for bi in range(b):
+        if float(torch.rand((), device=out.device).item()) > prob:
+            continue
+        for _ in range(num_blocks):
+            rh = float(torch.empty((), device=out.device).uniform_(min_ratio, max_ratio).item())
+            rw = float(torch.empty((), device=out.device).uniform_(min_ratio, max_ratio).item())
+            hh = max(1, int(round(h * rh)))
+            ww = max(1, int(round(w * rw)))
+            y0 = int(torch.randint(0, max(1, h - hh + 1), (1,), device=out.device).item())
+            x0 = int(torch.randint(0, max(1, w - ww + 1), (1,), device=out.device).item())
+            out[bi, :, y0:y0 + hh, x0:x0 + ww] = fill
+    return out
+
+
+def _resolve_fixed_wh_px(fixed_box_wh_px, label: int):
+    if isinstance(fixed_box_wh_px, (list, tuple)) and len(fixed_box_wh_px) == 2:
+        return float(fixed_box_wh_px[0]), float(fixed_box_wh_px[1])
+    if isinstance(fixed_box_wh_px, dict):
+        key = str(int(label))
+        if key in fixed_box_wh_px:
+            v = fixed_box_wh_px[key]
+            if isinstance(v, (list, tuple)) and len(v) == 2:
+                return float(v[0]), float(v[1])
+    return 20.0, 20.0
+
+
+def _build_point_fixed_targets(targets, point_teacher, model_inputs=None):
+    if not isinstance(point_teacher, dict):
+        return targets
+    fixed_box_wh_px = point_teacher.get("fixed_box_wh_px", (20, 20))
+    if model_inputs is not None:
+        h_img, w_img = _extract_hw_from_model_inputs(model_inputs)
+        w_img = float(max(1, w_img))
+        h_img = float(max(1, h_img))
+    else:
+        w_img, h_img = 640.0, 640.0
+    bag_cfg = point_teacher.get("Bag", None) or point_teacher.get("bag", None) or {}
+    bag_enabled = isinstance(bag_cfg, dict) and bag_cfg.get("enabled", False)
+    bag_size = int(bag_cfg.get("bag_size", 16)) if bag_enabled else 0
+    aspect_ratios = bag_cfg.get("aspect_ratios", [1.0]) if bag_enabled else [1.0]
+    wh_px_list = bag_cfg.get("wh_px", []) if bag_enabled else []
+    jitter = float(bag_cfg.get("jitter", 0.0)) if bag_enabled else 0.0
+    out_targets = []
+    for t in targets:
+        boxes = t.get("boxes", None)
+        labels = t.get("labels", None)
+        if not isinstance(boxes, torch.Tensor) or not isinstance(labels, torch.Tensor):
+            out_targets.append(t)
+            continue
+        if boxes.numel() == 0:
+            out_targets.append(dict(t))
+            continue
+        pts = boxes[..., :2].detach().float()
+        labs = labels.detach().long()
+        new_boxes = []
+        for i in range(int(labs.numel())):
+            ww, hh = _resolve_fixed_wh_px(fixed_box_wh_px, int(labs[i].item()))
+            new_boxes.append([float(pts[i, 0].item()), float(pts[i, 1].item()), float(ww) / w_img, float(hh) / h_img])
+        t_new = dict(t)
+        t_new["boxes"] = torch.as_tensor(new_boxes, device=boxes.device, dtype=torch.float32).clamp(min=0.0, max=1.0)
+        if bag_enabled and bag_size > 0:
+            n = int(labs.numel())
+            m = int(bag_size)
+            centers = pts[:, None, :].repeat(1, m, 1)
+            cand_wh = torch.zeros((n, m, 2), device=boxes.device, dtype=torch.float32)
+            if wh_px_list:
+                wh_pool = []
+                for it in wh_px_list:
+                    if isinstance(it, (list, tuple)) and len(it) == 2:
+                        wh_pool.append((float(it[0]), float(it[1])))
+                    else:
+                        s = float(it)
+                        wh_pool.append((s, s))
+            else:
+                wh_pool = [(float(t_new["boxes"][i, 2].item() * w_img), float(t_new["boxes"][i, 3].item() * h_img)) for i in range(n)]
+            ar_pool = [float(x) for x in aspect_ratios] if aspect_ratios else [1.0]
+            for i in range(n):
+                base_w = float(t_new["boxes"][i, 2].item() * w_img)
+                base_h = float(t_new["boxes"][i, 3].item() * h_img)
+                cand_wh[i, 0, 0] = base_w
+                cand_wh[i, 0, 1] = base_h
+                for j in range(1, m):
+                    wi, hi = wh_pool[int(torch.randint(0, len(wh_pool), (1,), device=boxes.device).item())]
+                    ar = ar_pool[int(torch.randint(0, len(ar_pool), (1,), device=boxes.device).item())]
+                    ar = max(1e-6, float(ar))
+                    s = math.sqrt(ar)
+                    ww = wi * s
+                    hh = hi / s
+                    if jitter > 0:
+                        fac = float(torch.empty((), device=boxes.device).uniform_(max(0.0, 1.0 - jitter), 1.0 + jitter).item())
+                        ww *= fac
+                        hh *= fac
+                    cand_wh[i, j, 0] = max(1.0, float(ww))
+                    cand_wh[i, j, 1] = max(1.0, float(hh))
+            cand_wh_norm = cand_wh.clone()
+            cand_wh_norm[:, :, 0] /= float(w_img)
+            cand_wh_norm[:, :, 1] /= float(h_img)
+            t_new["mil_boxes"] = torch.cat([centers, cand_wh_norm], dim=2).clamp(min=0.0, max=1.0)
+            t_new["mil_scores"] = torch.zeros((n, m), device=boxes.device, dtype=torch.float32)
+        out_targets.append(t_new)
+    return out_targets
+
+
+def _ensure_point_teacher_bag(targets, point_teacher, model_inputs=None):
+    if not isinstance(point_teacher, dict):
+        return targets
+    bag_cfg = point_teacher.get("Bag", None) or point_teacher.get("bag", None) or {}
+    if not isinstance(bag_cfg, dict) or not bag_cfg.get("enabled", False):
+        return targets
+    bag_size = int(bag_cfg.get("bag_size", 16))
+    if bag_size <= 0:
+        return targets
+    if model_inputs is not None:
+        h_img, w_img = _extract_hw_from_model_inputs(model_inputs)
+        w_img = float(max(1, w_img))
+        h_img = float(max(1, h_img))
+    else:
+        w_img, h_img = 640.0, 640.0
+    aspect_ratios = bag_cfg.get("aspect_ratios", [1.0])
+    wh_px_list = bag_cfg.get("wh_px", [])
+    jitter = float(bag_cfg.get("jitter", 0.0))
+    if wh_px_list:
+        wh_pool = []
+        for it in wh_px_list:
+            if isinstance(it, (list, tuple)) and len(it) == 2:
+                wh_pool.append((float(it[0]), float(it[1])))
+            else:
+                s = float(it)
+                wh_pool.append((s, s))
+    else:
+        wh_pool = None
+    ar_pool = [float(x) for x in aspect_ratios] if aspect_ratios else [1.0]
+    out = []
+    for t in targets:
+        boxes = t.get("boxes", None)
+        labels = t.get("labels", None)
+        if not isinstance(boxes, torch.Tensor) or not isinstance(labels, torch.Tensor) or boxes.numel() == 0:
+            out.append(t)
+            continue
+        if isinstance(t.get("mil_boxes", None), torch.Tensor) and t["mil_boxes"].numel() > 0:
+            out.append(t)
+            continue
+        pts = boxes[..., :2].detach().float()
+        wh_base = boxes[..., 2:].detach().float()
+        n = int(pts.shape[0])
+        m = int(bag_size)
+        centers = pts[:, None, :].repeat(1, m, 1)
+        cand_wh = torch.zeros((n, m, 2), device=boxes.device, dtype=torch.float32)
+        cand_wh[:, 0, 0] = (wh_base[:, 0] * w_img).clamp(min=1.0)
+        cand_wh[:, 0, 1] = (wh_base[:, 1] * h_img).clamp(min=1.0)
+        for i in range(n):
+            for j in range(1, m):
+                if wh_pool is None:
+                    wi = float(cand_wh[i, 0, 0].item())
+                    hi = float(cand_wh[i, 0, 1].item())
+                else:
+                    wi, hi = wh_pool[int(torch.randint(0, len(wh_pool), (1,), device=boxes.device).item())]
+                ar = ar_pool[int(torch.randint(0, len(ar_pool), (1,), device=boxes.device).item())]
+                ar = max(1e-6, float(ar))
+                s = math.sqrt(ar)
+                ww = wi * s
+                hh = hi / s
+                if jitter > 0:
+                    fac = float(torch.empty((), device=boxes.device).uniform_(max(0.0, 1.0 - jitter), 1.0 + jitter).item())
+                    ww *= fac
+                    hh *= fac
+                cand_wh[i, j, 0] = max(1.0, float(ww))
+                cand_wh[i, j, 1] = max(1.0, float(hh))
+        cand_wh_norm = cand_wh.clone()
+        cand_wh_norm[:, :, 0] /= float(w_img)
+        cand_wh_norm[:, :, 1] /= float(h_img)
+        t_new = dict(t)
+        t_new["mil_boxes"] = torch.cat([centers, cand_wh_norm], dim=2).clamp(min=0.0, max=1.0)
+        t_new["mil_scores"] = torch.zeros((n, m), device=boxes.device, dtype=torch.float32)
+        out.append(t_new)
+    return out
  
  
 class _ScaleMemoryBank:
@@ -570,6 +768,7 @@ def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, cri
     verbose_type = kwargs.get('verbose_type', 'origin') # 显示方式  
     point_sup = kwargs.get("point_sup", None)
     point_sup_state = kwargs.get("point_sup_state", None)
+    point_teacher = kwargs.get("point_teacher", None)
     use_focal_loss = bool(kwargs.get("use_focal_loss", True))
     header = 'Epoch: {}/{}'.format(epoch, epoches)  # 训练过程的日志标题
      
@@ -610,7 +809,47 @@ def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, cri
             with dt[1]:  
                 with torch.autocast(device_type=str(device), cache_enabled=True):     
                     targets_for_train = targets
-                    if _is_point_supervision_enabled(point_sup):
+                    student_inputs = model_inputs
+                    if _is_point_teacher_enabled(point_teacher):
+                        student_inputs = _random_block_mask(model_inputs, point_teacher.get("RandomMask", None) if isinstance(point_teacher, dict) else None)
+                        burn_in_steps = int(point_teacher.get("burn_in_steps", 0) or 0) if isinstance(point_teacher, dict) else 0
+                        if burn_in_steps > 0 and int(global_step) < burn_in_steps:
+                            targets_for_train = _build_point_fixed_targets(targets, point_teacher, model_inputs=model_inputs)
+                            targets_for_train = _ensure_point_teacher_bag(targets_for_train, point_teacher, model_inputs=model_inputs)
+                        else:
+                            if _is_point_supervision_enabled(point_sup):
+                                if ema is None:
+                                    raise RuntimeError("PointSupervision requires EMA teacher. Set use_ema=True.")
+                                fg_cfg = point_sup.get("FeatureGrowth", None) or point_sup.get("feature_growth", None) or {}
+                                fg_enabled = isinstance(fg_cfg, dict) and bool(fg_cfg.get("enabled", False))
+                                fg_level = int(fg_cfg.get("feature_level", 1)) if fg_enabled else 0
+                                with torch.no_grad():
+                                    if fg_enabled:
+                                        try:
+                                            teacher_outputs = ema.module(model_inputs, targets=None, return_feature=True, feature_level=fg_level)
+                                        except TypeError:
+                                            teacher_outputs = ema.module(model_inputs, targets=None)
+                                    else:
+                                        teacher_outputs = ema.module(model_inputs, targets=None)
+                                point_sup_eff = point_sup
+                                if isinstance(point_sup, dict) and isinstance(point_teacher, dict):
+                                    point_sup_eff = dict(point_sup)
+                                    for k in ("score_thresh", "max_l1_dist", "cost_point", "cost_class", "cost_prior", "snap_center", "keep_all_points"):
+                                        if k in point_teacher:
+                                            point_sup_eff[k] = point_teacher[k]
+                                targets_for_train = _build_point_pseudo_targets(
+                                    teacher_outputs,
+                                    targets,
+                                    point_sup=point_sup_eff,
+                                    use_focal_loss=use_focal_loss,
+                                    model_inputs=model_inputs,
+                                    point_sup_state=point_sup_state,
+                                    writer=writer,
+                                    global_step=global_step,
+                                    epoch=epoch,
+                                )
+                                targets_for_train = _ensure_point_teacher_bag(targets_for_train, point_teacher, model_inputs=model_inputs)
+                    elif _is_point_supervision_enabled(point_sup):
                         if ema is None:
                             raise RuntimeError("PointSupervision requires EMA teacher. Set use_ema=True.")
                         fg_cfg = point_sup.get("FeatureGrowth", None) or point_sup.get("feature_growth", None) or {}
@@ -635,7 +874,7 @@ def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, cri
                             global_step=global_step,
                             epoch=epoch,
                         )
-                    outputs = model(model_inputs, targets=targets_for_train)     
+                    outputs = model(student_inputs, targets=targets_for_train)     
  
             # 处理异常情况，避免 NaN 或 Inf 影响训练 
             if torch.isnan(outputs['pred_boxes']).any() or torch.isinf(outputs['pred_boxes']).any():
@@ -670,7 +909,47 @@ def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, cri
         else:    
             with dt[1]:
                 targets_for_train = targets
-                if _is_point_supervision_enabled(point_sup):
+                student_inputs = model_inputs
+                if _is_point_teacher_enabled(point_teacher):
+                    student_inputs = _random_block_mask(model_inputs, point_teacher.get("RandomMask", None) if isinstance(point_teacher, dict) else None)
+                    burn_in_steps = int(point_teacher.get("burn_in_steps", 0) or 0) if isinstance(point_teacher, dict) else 0
+                    if burn_in_steps > 0 and int(global_step) < burn_in_steps:
+                        targets_for_train = _build_point_fixed_targets(targets, point_teacher, model_inputs=model_inputs)
+                        targets_for_train = _ensure_point_teacher_bag(targets_for_train, point_teacher, model_inputs=model_inputs)
+                    else:
+                        if _is_point_supervision_enabled(point_sup):
+                            if ema is None:
+                                raise RuntimeError("PointSupervision requires EMA teacher. Set use_ema=True.")
+                            fg_cfg = point_sup.get("FeatureGrowth", None) or point_sup.get("feature_growth", None) or {}
+                            fg_enabled = isinstance(fg_cfg, dict) and bool(fg_cfg.get("enabled", False))
+                            fg_level = int(fg_cfg.get("feature_level", 1)) if fg_enabled else 0
+                            with torch.no_grad():
+                                if fg_enabled:
+                                    try:
+                                        teacher_outputs = ema.module(model_inputs, targets=None, return_feature=True, feature_level=fg_level)
+                                    except TypeError:
+                                        teacher_outputs = ema.module(model_inputs, targets=None)
+                                else:
+                                    teacher_outputs = ema.module(model_inputs, targets=None)
+                            point_sup_eff = point_sup
+                            if isinstance(point_sup, dict) and isinstance(point_teacher, dict):
+                                point_sup_eff = dict(point_sup)
+                                for k in ("score_thresh", "max_l1_dist", "cost_point", "cost_class", "cost_prior", "snap_center", "keep_all_points"):
+                                    if k in point_teacher:
+                                        point_sup_eff[k] = point_teacher[k]
+                            targets_for_train = _build_point_pseudo_targets(
+                                teacher_outputs,
+                                targets,
+                                point_sup=point_sup_eff,
+                                use_focal_loss=use_focal_loss,
+                                model_inputs=model_inputs,
+                                point_sup_state=point_sup_state,
+                                writer=writer,
+                                global_step=global_step,
+                                epoch=epoch,
+                            )
+                            targets_for_train = _ensure_point_teacher_bag(targets_for_train, point_teacher, model_inputs=model_inputs)
+                elif _is_point_supervision_enabled(point_sup):
                     if ema is None:
                         raise RuntimeError("PointSupervision requires EMA teacher. Set use_ema=True.")
                     fg_cfg = point_sup.get("FeatureGrowth", None) or point_sup.get("feature_growth", None) or {}
@@ -695,7 +974,7 @@ def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, cri
                         global_step=global_step,
                         epoch=epoch,
                     )
-                outputs = model(model_inputs, targets=targets_for_train)  # 前向传播     
+                outputs = model(student_inputs, targets=targets_for_train)  # 前向传播     
             with dt[2]: 
                 loss_dict = criterion(outputs, targets_for_train, **metas)  # 计算损失   
                 loss: torch.Tensor = sum(loss_dict.values())  # 总损失
