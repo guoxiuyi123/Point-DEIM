@@ -102,6 +102,23 @@ class DetSolver(BaseSolver):
     def fit(self, cfg_str):
         self.train()    
         args = self.cfg   
+        point_teacher = self.cfg.yaml_cfg.get("PointTeacher", None)
+        point_teacher_enabled = isinstance(point_teacher, dict) and point_teacher.get("enabled", False)
+        point_sup = self.cfg.yaml_cfg.get("PointSupervision", None)
+        if point_teacher_enabled:
+            if not isinstance(point_sup, dict):
+                point_sup = {}
+            point_sup = dict(point_sup)
+            point_sup["enabled"] = True
+            if self.ema is None:
+                raise RuntimeError("PointTeacher requires EMA teacher. Set use_ema=True.")
+            module = dist_utils.de_parallel(self.model)
+            for m in module.modules():
+                if hasattr(m, "num_denoising"):
+                    try:
+                        setattr(m, "num_denoising", 0)
+                    except Exception:
+                        pass
 
         if dist_utils.is_main_process():     
             with open(self.output_dir / 'args.json', 'w') as json_file:
@@ -180,6 +197,8 @@ class DetSolver(BaseSolver):
                 output_dir=self.output_dir,
                 epoches=args.epoches, # 总的训练次数
                 verbose_type=args.verbose_type,
+                point_sup=point_sup,
+                point_teacher=point_teacher,
             )
 
             if torch.cuda.is_available():     

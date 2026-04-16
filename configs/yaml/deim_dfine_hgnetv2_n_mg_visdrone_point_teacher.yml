@@ -1,0 +1,46 @@
+__include__: [
+  '../dfine/dfine_hgnetv2_n_custom.yml',
+  '../dataset/visdrone_detection.yml',
+  '../base/deim.yml'
+]
+
+print_freq: 20
+output_dir: ./outputs/deim_hgnetv2_n_visdrone_point_teacher
+
+use_ema: True
+
+PointTeacher:
+  enabled: True
+  burn_in_steps: 4000
+  fixed_box_wh_px: [20, 20]
+  score_thresh: 0.0
+  max_l1_dist: 1.0
+  snap_center: True
+  keep_all_points: True
+  RandomMask:
+    enabled: True
+    prob: 0.5
+    num_blocks: 4
+    min_ratio: 0.05
+    max_ratio: 0.2
+    fill: 0.0
+  Bag:
+    enabled: True
+    bag_size: 16
+    aspect_ratios: [0.5, 1.0, 2.0]
+    wh_px: [6, 8, 10, 12, 16, 20, 24, 32, 40, 48, 64, 96, 128, 160, 192, 256]
+    jitter: 0.1
+
+PointSupervision:
+  enabled: True
+  score_thresh: 0.0
+  max_l1_dist: 1.0
+  snap_center: True
+  keep_all_points: True
+  cost_point: 1.0
+  cost_class: 2.0
+
+DEIMCriterion:
+  weight_dict: {loss_mal: 1, loss_bbox: 5, loss_giou: 2, loss_fgl: 0.15, loss_ddf: 1.5, loss_points_mil_reg: 5}
+  losses: ['mal', 'boxes', 'points_mil_reg', 'local']
+  mil_beta_score: 10.0

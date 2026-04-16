@@ -12,7 +12,7 @@ train_dataloader:
   dataset:
     type: CocoDetection
     img_folder: /home/pc/gxy/dataset/dataset_visdrone/VisDrone2019-DET-train/images
-    ann_file: /home/pc/gxy/dataset/dataset_visdrone/VisDrone2019-DET-train/annotations/train.json
+    ann_file: /home/pc/gxy/dataset/dataset_visdrone/deim_point_only_6px/annotations/instances_train.json
     # img_folder: /datasets/MoGuiMianJu/visdrone/VisDrone2019-DET-train/images
     # ann_file: /datasets/MoGuiMianJu/visdrone/VisDrone2019-DET-train/annotations/train.json
     return_masks: False

@@ -54,7 +54,8 @@ class DEIMCriterion(nn.Module):
         ccm_params=None,
         density_recall_penalty=1.1,     
         density_precision_penalty=1.3,
-        mask_point_sample_ratio=8
+        mask_point_sample_ratio=8,
+        mil_beta_score=10.0
         ):
         """Create the criterion.    
         Parameters: 
@@ -88,6 +89,7 @@ class DEIMCriterion(nn.Module):
         self.density_recall_penalty = density_recall_penalty
         self.density_precision_penalty = density_precision_penalty     
         self.mask_point_sample_ratio = mask_point_sample_ratio
+        self.mil_beta_score = float(mil_beta_score)
         self.model = None
         self._loss_config_logged = False
   
@@ -454,6 +456,52 @@ class DEIMCriterion(nn.Module):
         del target_masks  
         return losses 
 
+    def loss_points_mil_reg(self, outputs, targets, indices, num_boxes, beta: float = 10.0):
+        assert 'pred_boxes' in outputs
+        idx = self._get_src_permutation_idx(indices)
+        src_boxes = outputs['pred_boxes'][idx]
+        if src_boxes.numel() == 0:
+            return {'loss_points_mil_reg': src_boxes.sum()}
+        cand_list = []
+        score_list = []
+        for t, (_, j) in zip(targets, indices):
+            mb = t.get('mil_boxes', None)
+            ms = t.get('mil_scores', None)
+            if not isinstance(mb, torch.Tensor) or mb.numel() == 0:
+                cand_list.append(None)
+                score_list.append(None)
+            else:
+                cand_list.append(mb[j])
+                score_list.append(ms[j] if isinstance(ms, torch.Tensor) else None)
+        if any(x is None for x in cand_list):
+            return {'loss_points_mil_reg': src_boxes.sum() * 0.0}
+        cand_boxes = torch.cat(cand_list, dim=0).to(src_boxes.device).float()
+        if cand_boxes.ndim != 3 or cand_boxes.shape[0] != src_boxes.shape[0]:
+            return {'loss_points_mil_reg': src_boxes.sum() * 0.0}
+        m = int(cand_boxes.shape[1])
+        cand_scores = None
+        if not any(x is None for x in score_list):
+            cand_scores = torch.cat(score_list, dim=0).to(src_boxes.device).float()
+            if cand_scores.ndim != 2 or cand_scores.shape[0] != src_boxes.shape[0] or cand_scores.shape[1] != m:
+                cand_scores = None
+        src_wh = src_boxes[:, 2:].clamp(min=1e-6)
+        cand_wh = cand_boxes[:, :, 2:].clamp(min=1e-6)
+        l1_wh = torch.abs(src_wh[:, None, :] - cand_wh).sum(dim=-1)
+        src_flat = src_boxes[:, None, :].repeat(1, m, 1).reshape(-1, 4)
+        cand_flat = cand_boxes.reshape(-1, 4)
+        src_xyxy = box_cxcywh_to_xyxy(src_flat)
+        cand_xyxy = box_cxcywh_to_xyxy(cand_flat)
+        giou = bbox_iou_aligned_xyxy(src_xyxy, cand_xyxy, iou_type='giou')
+        liou = (1.0 - giou).view(-1, m).clamp(min=0.0, max=2.0)
+        total = l1_wh + liou
+        beta_score = float(getattr(self, 'mil_beta_score', beta))
+        if cand_scores is None:
+            w = torch.full_like(total, 1.0 / float(m))
+        else:
+            w = torch.softmax(beta_score * cand_scores.detach(), dim=1)
+        loss = (w * total).sum(dim=1).sum() / num_boxes
+        return {'loss_points_mil_reg': loss}
+
     def _get_src_permutation_idx(self, indices):
         # permute predictions following indices
         batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
@@ -499,6 +547,7 @@ class DEIMCriterion(nn.Module):
             'vfl': self.loss_labels_vfl,  
             'mal': self.loss_labels_mal,
             'local': self.loss_local,
+            'points_mil_reg': self.loss_points_mil_reg,
             'cardinality': self.loss_cardinality,
             'ccm': self.loss_ccm,  
             'densitymap': self.loss_densitymap,
