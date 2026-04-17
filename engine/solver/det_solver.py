@@ -120,7 +120,12 @@ class DetSolver(BaseSolver):
                         setattr(m, "num_denoising", 0)
                     except Exception:
                         pass
-            dspe_cfg = point_teacher.get("DSPE", None) or point_teacher.get("dspe", None) or {}
+            dspe_cfg = {}
+            if isinstance(point_teacher, dict):
+                dspe_cfg = point_teacher.get("DSPE", None) or point_teacher.get("dspe", None) or {}
+            if not (isinstance(dspe_cfg, dict) and dspe_cfg):
+                if isinstance(point_sup, dict):
+                    dspe_cfg = point_sup.get("DSPE", None) or point_sup.get("dspe", None) or {}
             if isinstance(dspe_cfg, dict) and dspe_cfg.get("enabled", False):
                 num_classes = int(self.cfg.yaml_cfg.get("num_classes", 0) or 0)
                 if num_classes > 0:
@@ -128,7 +133,7 @@ class DetSolver(BaseSolver):
                     init_std = dspe_cfg.get("init_std_wh_px", dspe_cfg.get("init_mean_wh_px", (20.0, 20.0)))
                     min_std = dspe_cfg.get("min_std_px", (0.35, 0.35))
                     bank = _ScaleMemoryBank(num_classes=num_classes, init_mean_wh_px=init_mean, init_std_wh_px=init_std, min_std_px=min_std)
-                    point_teacher_state = {"scale_bank": bank, "num_classes": num_classes}
+                    point_teacher_state = {"scale_bank": bank, "num_classes": num_classes, "dspe_cfg": dict(dspe_cfg)}
 
         if dist_utils.is_main_process():     
             with open(self.output_dir / 'args.json', 'w') as json_file:

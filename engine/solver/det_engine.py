@@ -59,6 +59,50 @@ def _is_point_teacher_dspe_enabled(point_teacher):
     return isinstance(dspe, dict) and bool(dspe.get("enabled", False))
 
 
+def _get_point_teacher_dspe_cfg(point_teacher, point_teacher_state=None):
+    dspe_cfg = {}
+    if isinstance(point_teacher, dict):
+        dspe_cfg = point_teacher.get("DSPE", None) or point_teacher.get("dspe", None) or {}
+        if isinstance(dspe_cfg, dict) and dspe_cfg:
+            return dspe_cfg
+    if isinstance(point_teacher_state, dict):
+        dspe_cfg = point_teacher_state.get("dspe_cfg", None)
+        if isinstance(dspe_cfg, dict):
+            return dspe_cfg
+    return {}
+
+
+def _get_point_sup_density_cfg(point_sup):
+    if not isinstance(point_sup, dict):
+        return {}
+    cfg = point_sup.get("DensityLimit", None) or point_sup.get("density_limit", None) or {}
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def _get_point_sup_feature_growth_cfg(point_sup):
+    if not isinstance(point_sup, dict):
+        return {}
+    cfg = point_sup.get("FeatureGrowth", None) or point_sup.get("feature_growth", None) or {}
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def _density_knn_max_wh_px(points_norm: torch.Tensor, w_img: float, h_img: float, knn_k: int, margin: float, global_min_wh_px: float, global_max_wh_px: float):
+    n = int(points_norm.shape[0])
+    if n == 0:
+        return torch.empty((0,), device=points_norm.device, dtype=torch.float32)
+    if n == 1:
+        return torch.full((1,), float(global_max_wh_px), device=points_norm.device, dtype=torch.float32)
+    pts = points_norm.detach().float().clone()
+    pts_px = torch.stack([pts[:, 0] * w_img, pts[:, 1] * h_img], dim=1)
+    d = torch.cdist(pts_px, pts_px, p=2)
+    d.fill_diagonal_(float("inf"))
+    k = max(1, int(knn_k))
+    kth = torch.topk(d, k, dim=1, largest=False).values[:, -1]
+    max_wh = kth * float(margin)
+    max_wh = max_wh.clamp(min=float(global_min_wh_px), max=float(global_max_wh_px))
+    return max_wh
+
+
 class _ScaleMemoryBank:
     def __init__(self, num_classes: int, init_mean_wh_px=(20.0, 20.0), init_std_wh_px=(20.0, 20.0), min_std_px=(0.35, 0.35)):
         self.num_classes = int(num_classes)
@@ -69,7 +113,7 @@ class _ScaleMemoryBank:
         self.min_std_px = torch.as_tensor(min_std_px, dtype=torch.float32).view(1, 2).repeat(self.num_classes, 1).clone()
         self.count = torch.zeros((self.num_classes,), dtype=torch.long)
 
-    def update(self, labels: torch.Tensor, wh_px: torch.Tensor, scores: torch.Tensor = None, beta: float = 0.001, score_thresh: float = 0.0, min_wh_px: float = 1.0, max_wh_px: float = 1e6):
+    def update(self, labels: torch.Tensor, wh_px: torch.Tensor, scores: torch.Tensor = None, beta: float = 0.001, score_thresh: float = 0.0, min_wh_px: float = 1.0, max_wh_px: float = 1e6, max_area_ratio: float = None):
         if labels.numel() == 0:
             return
         labels = labels.detach().long().view(-1)
@@ -86,6 +130,7 @@ class _ScaleMemoryBank:
         beta = float(beta)
         min_wh_px = float(min_wh_px)
         max_wh_px = float(max_wh_px)
+        max_area_ratio = float(max_area_ratio) if max_area_ratio is not None else None
         for l, wh in zip(labels.tolist(), wh_px):
             if l < 0 or l >= self.num_classes:
                 continue
@@ -93,6 +138,12 @@ class _ScaleMemoryBank:
             h = float(wh[1].item())
             if not (min_wh_px <= w <= max_wh_px and min_wh_px <= h <= max_wh_px):
                 continue
+            if max_area_ratio is not None and max_area_ratio > 0:
+                mean_wh = self.mean_wh_px[l]
+                mean_area = float((mean_wh[0] * mean_wh[1]).item())
+                cur_area = float(w * h)
+                if mean_area > 1e-6 and (cur_area / mean_area) > max_area_ratio:
+                    continue
             prev_mean = self.mean_wh_px[l].clone()
             new_mean = (1.0 - beta) * prev_mean + beta * torch.tensor([w, h], dtype=torch.float32)
             diff = torch.tensor([w, h], dtype=torch.float32) - new_mean
@@ -205,7 +256,7 @@ def _resolve_fixed_wh_px(fixed_box_wh_px, label: int):
     return 20.0, 20.0
 
 
-def _build_point_fixed_targets(targets, point_teacher, model_inputs=None, point_teacher_state=None):
+def _build_point_fixed_targets(targets, point_teacher, model_inputs=None, point_teacher_state=None, point_sup=None):
     if not isinstance(point_teacher, dict):
         return targets
     fixed_box_wh_px = point_teacher.get("fixed_box_wh_px", (20, 20))
@@ -221,7 +272,7 @@ def _build_point_fixed_targets(targets, point_teacher, model_inputs=None, point_
     aspect_ratios = bag_cfg.get("aspect_ratios", [1.0]) if bag_enabled else [1.0]
     wh_px_list = bag_cfg.get("wh_px", []) if bag_enabled else []
     jitter = float(bag_cfg.get("jitter", 0.0)) if bag_enabled else 0.0
-    dspe_cfg = point_teacher.get("DSPE", None) or point_teacher.get("dspe", None) or {}
+    dspe_cfg = _get_point_teacher_dspe_cfg(point_teacher, point_teacher_state=point_teacher_state)
     dspe_enabled = isinstance(dspe_cfg, dict) and bool(dspe_cfg.get("enabled", False))
     scale_bank = None
     if dspe_enabled and isinstance(point_teacher_state, dict):
@@ -230,6 +281,12 @@ def _build_point_fixed_targets(targets, point_teacher, model_inputs=None, point_
     explore_wh_px = dspe_cfg.get("explore_wh_px", wh_px_list) if dspe_enabled else wh_px_list
     min_wh_px = float(dspe_cfg.get("pseudo_min_wh_px", 2.0)) if dspe_enabled else 1.0
     max_wh_px = float(dspe_cfg.get("pseudo_max_wh_px", 256.0)) if dspe_enabled else 1e6
+    density_cfg = _get_point_sup_density_cfg(point_sup)
+    density_enabled = bool(density_cfg.get("enabled", False))
+    knn_k = int(density_cfg.get("knn_k", 1))
+    margin_factor = float(density_cfg.get("density_margin_factor", 1.2))
+    global_max_wh_px = float(density_cfg.get("global_max_wh_px", 256.0))
+    global_min_wh_px = float(density_cfg.get("global_min_wh_px", 2.0))
     out_targets = []
     for t in targets:
         boxes = t.get("boxes", None)
@@ -242,9 +299,18 @@ def _build_point_fixed_targets(targets, point_teacher, model_inputs=None, point_
             continue
         pts = boxes[..., :2].detach().float()
         labs = labels.detach().long()
+        max_wh_px_per_point = None
+        if density_enabled:
+            max_wh_px_per_point = _density_knn_max_wh_px(
+                pts, w_img=w_img, h_img=h_img, knn_k=knn_k, margin=margin_factor, global_min_wh_px=global_min_wh_px, global_max_wh_px=global_max_wh_px
+            )
         new_boxes = []
         for i in range(int(labs.numel())):
             ww, hh = _resolve_fixed_wh_px(fixed_box_wh_px, int(labs[i].item()))
+            if density_enabled and max_wh_px_per_point is not None:
+                mwh = float(max_wh_px_per_point[i].item())
+                ww = min(float(ww), mwh)
+                hh = min(float(hh), mwh)
             new_boxes.append([float(pts[i, 0].item()), float(pts[i, 1].item()), float(ww) / w_img, float(hh) / h_img])
         t_new = dict(t)
         t_new["boxes"] = torch.as_tensor(new_boxes, device=boxes.device, dtype=torch.float32).clamp(min=0.0, max=1.0)
@@ -308,7 +374,7 @@ def _build_point_fixed_targets(targets, point_teacher, model_inputs=None, point_
     return out_targets
 
 
-def _ensure_point_teacher_bag(targets, point_teacher, model_inputs=None, point_teacher_state=None):
+def _ensure_point_teacher_bag(targets, point_teacher, model_inputs=None, point_teacher_state=None, point_sup=None):
     if not isinstance(point_teacher, dict):
         return targets
     bag_cfg = point_teacher.get("Bag", None) or point_teacher.get("bag", None) or {}
@@ -326,7 +392,7 @@ def _ensure_point_teacher_bag(targets, point_teacher, model_inputs=None, point_t
     aspect_ratios = bag_cfg.get("aspect_ratios", [1.0])
     wh_px_list = bag_cfg.get("wh_px", [])
     jitter = float(bag_cfg.get("jitter", 0.0))
-    dspe_cfg = point_teacher.get("DSPE", None) or point_teacher.get("dspe", None) or {}
+    dspe_cfg = _get_point_teacher_dspe_cfg(point_teacher, point_teacher_state=point_teacher_state)
     dspe_enabled = isinstance(dspe_cfg, dict) and bool(dspe_cfg.get("enabled", False))
     scale_bank = None
     if dspe_enabled and isinstance(point_teacher_state, dict):
@@ -335,6 +401,12 @@ def _ensure_point_teacher_bag(targets, point_teacher, model_inputs=None, point_t
     explore_wh_px = dspe_cfg.get("explore_wh_px", wh_px_list) if dspe_enabled else wh_px_list
     min_wh_px = float(dspe_cfg.get("pseudo_min_wh_px", 2.0)) if dspe_enabled else 1.0
     max_wh_px = float(dspe_cfg.get("pseudo_max_wh_px", 256.0)) if dspe_enabled else 1e6
+    density_cfg = _get_point_sup_density_cfg(point_sup)
+    density_enabled = bool(density_cfg.get("enabled", False))
+    knn_k = int(density_cfg.get("knn_k", 1))
+    margin_factor = float(density_cfg.get("density_margin_factor", 1.2))
+    global_max_wh_px = float(density_cfg.get("global_max_wh_px", 256.0))
+    global_min_wh_px = float(density_cfg.get("global_min_wh_px", 2.0))
     if wh_px_list:
         wh_pool = []
         for it in wh_px_list:
@@ -360,6 +432,11 @@ def _ensure_point_teacher_bag(targets, point_teacher, model_inputs=None, point_t
         wh_base = boxes[..., 2:].detach().float()
         n = int(pts.shape[0])
         m = int(bag_size)
+        max_wh_px_per_point = None
+        if density_enabled:
+            max_wh_px_per_point = _density_knn_max_wh_px(
+                pts, w_img=w_img, h_img=h_img, knn_k=knn_k, margin=margin_factor, global_min_wh_px=global_min_wh_px, global_max_wh_px=global_max_wh_px
+            )
         centers = pts[:, None, :].repeat(1, m, 1)
         cand_wh = torch.zeros((n, m, 2), device=boxes.device, dtype=torch.float32)
         cand_wh[:, 0, 0] = (wh_base[:, 0] * w_img).clamp(min=1.0)
@@ -392,6 +469,10 @@ def _ensure_point_teacher_bag(targets, point_teacher, model_inputs=None, point_t
                     fac = float(torch.empty((), device=boxes.device).uniform_(max(0.0, 1.0 - jitter), 1.0 + jitter).item())
                     ww *= fac
                     hh *= fac
+                if density_enabled and max_wh_px_per_point is not None:
+                    mwh = float(max_wh_px_per_point[i].item())
+                    ww = min(float(ww), mwh)
+                    hh = min(float(hh), mwh)
                 cand_wh[i, j, 0] = max(1.0, float(ww))
                 cand_wh[i, j, 1] = max(1.0, float(hh))
         cand_wh_norm = cand_wh.clone()
@@ -421,20 +502,34 @@ def _build_point_pseudo_targets(teacher_outputs, targets, point_sup, use_focal_l
     h_img, w_img = _extract_hw_from_model_inputs(model_inputs) if model_inputs is not None else (640, 640)
     h_img = float(max(1, h_img))
     w_img = float(max(1, w_img))
-    dspe_cfg = point_teacher.get("DSPE", None) if isinstance(point_teacher, dict) else None
-    dspe_cfg = dspe_cfg if isinstance(dspe_cfg, dict) else {}
+    dspe_cfg = _get_point_teacher_dspe_cfg(point_teacher, point_teacher_state=point_teacher_state)
     update_beta = float(dspe_cfg.get("update_beta", 0.001))
     update_score_thresh = float(dspe_cfg.get("update_score_thresh", 0.2))
+    update_max_area_ratio = dspe_cfg.get("update_max_area_ratio", None)
     pseudo_min_wh_px = float(dspe_cfg.get("pseudo_min_wh_px", 2.0))
     pseudo_max_wh_px = float(dspe_cfg.get("pseudo_max_wh_px", 256.0))
     scale_bank = None
-    if _is_point_teacher_dspe_enabled(point_teacher) and isinstance(point_teacher_state, dict):
+    if isinstance(dspe_cfg, dict) and bool(dspe_cfg.get("enabled", False)) and isinstance(point_teacher_state, dict):
         scale_bank = point_teacher_state.get("scale_bank", None)
+    density_cfg = _get_point_sup_density_cfg(point_sup)
+    density_enabled = bool(density_cfg.get("enabled", False))
+    knn_k = int(density_cfg.get("knn_k", 1))
+    margin_factor = float(density_cfg.get("density_margin_factor", 1.2))
+    global_max_wh_px = float(density_cfg.get("global_max_wh_px", 256.0))
+    global_min_wh_px = float(density_cfg.get("global_min_wh_px", 2.0))
+    fg_cfg = _get_point_sup_feature_growth_cfg(point_sup)
+    fg_enabled = bool(fg_cfg.get("enabled", False))
+    fg_tau = float(fg_cfg.get("tau", 2.0))
     for b in range(bs):
         t = targets[b]
         pts = t["boxes"][..., :2].detach().float()
         labs = t["labels"].detach().long()
         total_gt_points += float(labs.numel())
+        max_wh_px_per_point = None
+        if density_enabled and pts.numel() > 0:
+            max_wh_px_per_point = _density_knn_max_wh_px(
+                pts, w_img=w_img, h_img=h_img, knn_k=knn_k, margin=margin_factor, global_min_wh_px=global_min_wh_px, global_max_wh_px=global_max_wh_px
+            )
         if pts.numel() == 0:
             t_new = dict(t)
             t_new["boxes"] = t["boxes"].new_zeros((0, 4)).float()
@@ -473,6 +568,27 @@ def _build_point_pseudo_targets(teacher_outputs, targets, point_sup, use_focal_l
         if snap_center and kept_boxes.numel() > 0:
             kept_boxes = kept_boxes.clone()
             kept_boxes[:, :2] = kept_pts
+        if kept_boxes.numel() > 0 and density_enabled and max_wh_px_per_point is not None:
+            point_idx = col_ind[keep]
+            mwh = max_wh_px_per_point[point_idx].to(kept_boxes.device).float()
+            wh_px = kept_boxes[:, 2:].detach().float()
+            wh_px = torch.stack([wh_px[:, 0] * w_img, wh_px[:, 1] * h_img], dim=1)
+            wh_px[:, 0] = torch.minimum(wh_px[:, 0], mwh)
+            wh_px[:, 1] = torch.minimum(wh_px[:, 1], mwh)
+            kept_boxes = kept_boxes.clone()
+            kept_boxes[:, 2] = (wh_px[:, 0] / w_img).clamp(min=1e-6, max=1.0)
+            kept_boxes[:, 3] = (wh_px[:, 1] / h_img).clamp(min=1e-6, max=1.0)
+        if kept_boxes.numel() > 0 and fg_enabled and isinstance(scale_bank, _ScaleMemoryBank):
+            mean = scale_bank.mean_wh_px[kept_labels.detach().cpu().clamp(min=0, max=scale_bank.num_classes - 1)].to(kept_boxes.device).float()
+            std = scale_bank.std_wh_px[kept_labels.detach().cpu().clamp(min=0, max=scale_bank.num_classes - 1)].to(kept_boxes.device).float()
+            lo = (mean - fg_tau * std).clamp(min=float(pseudo_min_wh_px))
+            hi = (mean + fg_tau * std).clamp(max=float(pseudo_max_wh_px))
+            wh_px = kept_boxes[:, 2:].detach().float()
+            wh_px = torch.stack([wh_px[:, 0] * w_img, wh_px[:, 1] * h_img], dim=1)
+            wh_px = torch.max(lo, torch.min(hi, wh_px))
+            kept_boxes = kept_boxes.clone()
+            kept_boxes[:, 2] = (wh_px[:, 0] / w_img).clamp(min=1e-6, max=1.0)
+            kept_boxes[:, 3] = (wh_px[:, 1] / h_img).clamp(min=1e-6, max=1.0)
         t_new = dict(t)
         t_new["boxes"] = kept_boxes
         t_new["labels"] = kept_labels
@@ -488,6 +604,7 @@ def _build_point_pseudo_targets(teacher_outputs, targets, point_sup, use_focal_l
                 score_thresh=update_score_thresh,
                 min_wh_px=pseudo_min_wh_px,
                 max_wh_px=pseudo_max_wh_px,
+                max_area_ratio=update_max_area_ratio,
             )
     if writer is not None and dist_utils.is_main_process() and global_step % 200 == 0:
         writer.add_scalar("PointSup/gt_points_per_iter", float(total_gt_points.item()), global_step)
@@ -595,8 +712,8 @@ def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, cri
                         student_inputs = _random_block_mask(model_inputs, point_teacher.get("RandomMask", None) if isinstance(point_teacher, dict) else None)
                         burn_in_steps = int(point_teacher.get("burn_in_steps", 0) or 0) if isinstance(point_teacher, dict) else 0
                         if burn_in_steps > 0 and int(global_step) < burn_in_steps:
-                            targets_for_train = _build_point_fixed_targets(targets, point_teacher, model_inputs=model_inputs, point_teacher_state=point_teacher_state)
-                            targets_for_train = _ensure_point_teacher_bag(targets_for_train, point_teacher, model_inputs=model_inputs, point_teacher_state=point_teacher_state)
+                            targets_for_train = _build_point_fixed_targets(targets, point_teacher, model_inputs=model_inputs, point_teacher_state=point_teacher_state, point_sup=point_sup)
+                            targets_for_train = _ensure_point_teacher_bag(targets_for_train, point_teacher, model_inputs=model_inputs, point_teacher_state=point_teacher_state, point_sup=point_sup)
                         elif _is_point_supervision_enabled(point_sup):
                             if ema is None:
                                 raise RuntimeError("PointTeacher requires EMA teacher. Set use_ema=True.")
@@ -619,7 +736,7 @@ def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, cri
                                 point_teacher=point_teacher,
                                 point_teacher_state=point_teacher_state,
                             )
-                            targets_for_train = _ensure_point_teacher_bag(targets_for_train, point_teacher, model_inputs=model_inputs, point_teacher_state=point_teacher_state)
+                            targets_for_train = _ensure_point_teacher_bag(targets_for_train, point_teacher, model_inputs=model_inputs, point_teacher_state=point_teacher_state, point_sup=point_sup)
                     outputs = model(student_inputs, targets=targets_for_train)     
  
             # 处理异常情况，避免 NaN 或 Inf 影响训练 
@@ -660,8 +777,8 @@ def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, cri
                     student_inputs = _random_block_mask(model_inputs, point_teacher.get("RandomMask", None) if isinstance(point_teacher, dict) else None)
                     burn_in_steps = int(point_teacher.get("burn_in_steps", 0) or 0) if isinstance(point_teacher, dict) else 0
                     if burn_in_steps > 0 and int(global_step) < burn_in_steps:
-                        targets_for_train = _build_point_fixed_targets(targets, point_teacher, model_inputs=model_inputs, point_teacher_state=point_teacher_state)
-                        targets_for_train = _ensure_point_teacher_bag(targets_for_train, point_teacher, model_inputs=model_inputs, point_teacher_state=point_teacher_state)
+                        targets_for_train = _build_point_fixed_targets(targets, point_teacher, model_inputs=model_inputs, point_teacher_state=point_teacher_state, point_sup=point_sup)
+                        targets_for_train = _ensure_point_teacher_bag(targets_for_train, point_teacher, model_inputs=model_inputs, point_teacher_state=point_teacher_state, point_sup=point_sup)
                     elif _is_point_supervision_enabled(point_sup):
                         if ema is None:
                             raise RuntimeError("PointTeacher requires EMA teacher. Set use_ema=True.")
@@ -684,7 +801,7 @@ def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, cri
                             point_teacher=point_teacher,
                             point_teacher_state=point_teacher_state,
                         )
-                        targets_for_train = _ensure_point_teacher_bag(targets_for_train, point_teacher, model_inputs=model_inputs, point_teacher_state=point_teacher_state)
+                        targets_for_train = _ensure_point_teacher_bag(targets_for_train, point_teacher, model_inputs=model_inputs, point_teacher_state=point_teacher_state, point_sup=point_sup)
                 outputs = model(student_inputs, targets=targets_for_train)  # 前向传播     
             with dt[2]: 
                 loss_dict = criterion(outputs, targets_for_train, **metas)  # 计算损失   

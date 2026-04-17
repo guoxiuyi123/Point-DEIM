@@ -36,7 +36,7 @@ def test_point_teacher_fixed_targets_shapes_and_ranges():
         },
     }
 
-    out = _build_point_fixed_targets(targets, point_teacher, model_inputs=model_inputs)
+    out = _build_point_fixed_targets(targets, point_teacher, model_inputs=model_inputs, point_sup=None)
     assert isinstance(out, list) and len(out) == 1
     t = out[0]
     assert t["boxes"].shape == (2, 4)
@@ -75,7 +75,7 @@ def test_point_teacher_bag_is_added_if_missing():
             "jitter": 0.0,
         },
     }
-    out = _ensure_point_teacher_bag(targets, point_teacher, model_inputs=model_inputs)
+    out = _ensure_point_teacher_bag(targets, point_teacher, model_inputs=model_inputs, point_sup=None)
     t = out[0]
     assert "mil_boxes" in t and "mil_scores" in t
     assert t["mil_boxes"].shape == (2, 6, 4)
@@ -113,7 +113,7 @@ def test_scale_memory_bank_updates_and_drives_bag():
         "Bag": {"enabled": True, "bag_size": 8, "aspect_ratios": [1.0], "wh_px": [6, 8, 10], "jitter": 0.0},
         "DSPE": {"enabled": True, "explore_ratio": 0.0, "explore_wh_px": [6, 8, 10], "pseudo_min_wh_px": 2, "pseudo_max_wh_px": 128},
     }
-    out = _ensure_point_teacher_bag(targets, point_teacher, model_inputs=model_inputs, point_teacher_state={"scale_bank": bank, "num_classes": 5})
+    out = _ensure_point_teacher_bag(targets, point_teacher, model_inputs=model_inputs, point_teacher_state={"scale_bank": bank, "num_classes": 5, "dspe_cfg": {"enabled": True}}, point_sup=None)
     t = out[0]
     assert t["mil_boxes"].shape == (1, 8, 4)
     wh_norm = t["mil_boxes"][0, :, 2:]
