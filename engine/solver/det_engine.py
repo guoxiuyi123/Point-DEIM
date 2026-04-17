@@ -52,6 +52,98 @@ def _is_point_supervision_enabled(point_sup):
 def _is_point_teacher_enabled(point_teacher):
     return isinstance(point_teacher, dict) and point_teacher.get("enabled", False)
 
+def _is_point_teacher_dspe_enabled(point_teacher):
+    if not isinstance(point_teacher, dict):
+        return False
+    dspe = point_teacher.get("DSPE", None) or point_teacher.get("dspe", None) or {}
+    return isinstance(dspe, dict) and bool(dspe.get("enabled", False))
+
+
+class _ScaleMemoryBank:
+    def __init__(self, num_classes: int, init_mean_wh_px=(20.0, 20.0), init_std_wh_px=(20.0, 20.0), min_std_px=(0.35, 0.35)):
+        self.num_classes = int(num_classes)
+        mean = torch.as_tensor(init_mean_wh_px, dtype=torch.float32).view(1, 2)
+        std = torch.as_tensor(init_std_wh_px, dtype=torch.float32).view(1, 2)
+        self.mean_wh_px = mean.repeat(self.num_classes, 1).clone()
+        self.std_wh_px = std.repeat(self.num_classes, 1).clone()
+        self.min_std_px = torch.as_tensor(min_std_px, dtype=torch.float32).view(1, 2).repeat(self.num_classes, 1).clone()
+        self.count = torch.zeros((self.num_classes,), dtype=torch.long)
+
+    def update(self, labels: torch.Tensor, wh_px: torch.Tensor, scores: torch.Tensor = None, beta: float = 0.001, score_thresh: float = 0.0, min_wh_px: float = 1.0, max_wh_px: float = 1e6):
+        if labels.numel() == 0:
+            return
+        labels = labels.detach().long().view(-1)
+        wh_px = wh_px.detach().float().view(-1, 2)
+        if scores is None:
+            keep = torch.ones((labels.numel(),), dtype=torch.bool, device=labels.device)
+        else:
+            scores = scores.detach().float().view(-1)
+            keep = scores >= float(score_thresh)
+        if not torch.any(keep):
+            return
+        labels = labels[keep].cpu()
+        wh_px = wh_px[keep].cpu()
+        beta = float(beta)
+        min_wh_px = float(min_wh_px)
+        max_wh_px = float(max_wh_px)
+        for l, wh in zip(labels.tolist(), wh_px):
+            if l < 0 or l >= self.num_classes:
+                continue
+            w = float(wh[0].item())
+            h = float(wh[1].item())
+            if not (min_wh_px <= w <= max_wh_px and min_wh_px <= h <= max_wh_px):
+                continue
+            prev_mean = self.mean_wh_px[l].clone()
+            new_mean = (1.0 - beta) * prev_mean + beta * torch.tensor([w, h], dtype=torch.float32)
+            diff = torch.tensor([w, h], dtype=torch.float32) - new_mean
+            prev_var = (self.std_wh_px[l].clone().clamp(min=0.0)) ** 2
+            new_var = (1.0 - beta) * prev_var + beta * (diff ** 2)
+            new_std = torch.sqrt(new_var).clamp(min=self.min_std_px[l])
+            self.mean_wh_px[l] = new_mean
+            self.std_wh_px[l] = new_std
+            self.count[l] += 1
+
+    def sample_wh_pool(self, label: int, k: int, explore_ratio: float, explore_wh_px, min_wh_px: float, max_wh_px: float, device=None):
+        k = int(k)
+        if k <= 0:
+            return []
+        label = int(label)
+        if label < 0 or label >= self.num_classes:
+            label = 0
+        mean = self.mean_wh_px[label].clone()
+        std = self.std_wh_px[label].clone()
+        if device is None:
+            device = torch.device("cpu")
+        mean = mean.to(device)
+        std = std.to(device)
+        min_wh_px = float(min_wh_px)
+        max_wh_px = float(max_wh_px)
+        explore_ratio = float(explore_ratio)
+        if isinstance(explore_wh_px, (list, tuple)) and len(explore_wh_px) > 0:
+            explore_pool = []
+            for it in explore_wh_px:
+                if isinstance(it, (list, tuple)) and len(it) == 2:
+                    explore_pool.append((float(it[0]), float(it[1])))
+                else:
+                    s = float(it)
+                    explore_pool.append((s, s))
+        else:
+            explore_pool = [(float(mean[0].item()), float(mean[1].item()))]
+        pool = []
+        for _ in range(k):
+            if float(torch.rand((), device=device).item()) < explore_ratio:
+                ww, hh = explore_pool[int(torch.randint(0, len(explore_pool), (1,), device=device).item())]
+                w = float(ww)
+                h = float(hh)
+            else:
+                samp = torch.normal(mean=mean, std=std)
+                w = float(samp[0].item())
+                h = float(samp[1].item())
+            w = float(max(min_wh_px, min(max_wh_px, w)))
+            h = float(max(min_wh_px, min(max_wh_px, h)))
+            pool.append((w, h))
+        return pool
+
 
 def _safe_sigmoid_probs(logits: torch.Tensor) -> torch.Tensor:
     return logits.float().sigmoid()
@@ -113,7 +205,7 @@ def _resolve_fixed_wh_px(fixed_box_wh_px, label: int):
     return 20.0, 20.0
 
 
-def _build_point_fixed_targets(targets, point_teacher, model_inputs=None):
+def _build_point_fixed_targets(targets, point_teacher, model_inputs=None, point_teacher_state=None):
     if not isinstance(point_teacher, dict):
         return targets
     fixed_box_wh_px = point_teacher.get("fixed_box_wh_px", (20, 20))
@@ -129,6 +221,15 @@ def _build_point_fixed_targets(targets, point_teacher, model_inputs=None):
     aspect_ratios = bag_cfg.get("aspect_ratios", [1.0]) if bag_enabled else [1.0]
     wh_px_list = bag_cfg.get("wh_px", []) if bag_enabled else []
     jitter = float(bag_cfg.get("jitter", 0.0)) if bag_enabled else 0.0
+    dspe_cfg = point_teacher.get("DSPE", None) or point_teacher.get("dspe", None) or {}
+    dspe_enabled = isinstance(dspe_cfg, dict) and bool(dspe_cfg.get("enabled", False))
+    scale_bank = None
+    if dspe_enabled and isinstance(point_teacher_state, dict):
+        scale_bank = point_teacher_state.get("scale_bank", None)
+    explore_ratio = float(dspe_cfg.get("explore_ratio", 0.5)) if dspe_enabled else 0.0
+    explore_wh_px = dspe_cfg.get("explore_wh_px", wh_px_list) if dspe_enabled else wh_px_list
+    min_wh_px = float(dspe_cfg.get("pseudo_min_wh_px", 2.0)) if dspe_enabled else 1.0
+    max_wh_px = float(dspe_cfg.get("pseudo_max_wh_px", 256.0)) if dspe_enabled else 1e6
     out_targets = []
     for t in targets:
         boxes = t.get("boxes", None)
@@ -152,7 +253,21 @@ def _build_point_fixed_targets(targets, point_teacher, model_inputs=None):
             m = int(bag_size)
             centers = pts[:, None, :].repeat(1, m, 1)
             cand_wh = torch.zeros((n, m, 2), device=boxes.device, dtype=torch.float32)
-            if wh_px_list:
+            if dspe_enabled and isinstance(scale_bank, _ScaleMemoryBank):
+                wh_pool_per_i = []
+                for i in range(n):
+                    wh_pool_per_i.append(
+                        scale_bank.sample_wh_pool(
+                            label=int(labs[i].item()),
+                            k=max(1, m),
+                            explore_ratio=explore_ratio,
+                            explore_wh_px=explore_wh_px,
+                            min_wh_px=min_wh_px,
+                            max_wh_px=max_wh_px,
+                            device=boxes.device,
+                        )
+                    )
+            elif wh_px_list:
                 wh_pool = []
                 for it in wh_px_list:
                     if isinstance(it, (list, tuple)) and len(it) == 2:
@@ -169,7 +284,10 @@ def _build_point_fixed_targets(targets, point_teacher, model_inputs=None):
                 cand_wh[i, 0, 0] = base_w
                 cand_wh[i, 0, 1] = base_h
                 for j in range(1, m):
-                    wi, hi = wh_pool[int(torch.randint(0, len(wh_pool), (1,), device=boxes.device).item())]
+                    if dspe_enabled and isinstance(scale_bank, _ScaleMemoryBank):
+                        wi, hi = wh_pool_per_i[i][j]
+                    else:
+                        wi, hi = wh_pool[int(torch.randint(0, len(wh_pool), (1,), device=boxes.device).item())]
                     ar = ar_pool[int(torch.randint(0, len(ar_pool), (1,), device=boxes.device).item())]
                     ar = max(1e-6, float(ar))
                     s = math.sqrt(ar)
@@ -190,7 +308,7 @@ def _build_point_fixed_targets(targets, point_teacher, model_inputs=None):
     return out_targets
 
 
-def _ensure_point_teacher_bag(targets, point_teacher, model_inputs=None):
+def _ensure_point_teacher_bag(targets, point_teacher, model_inputs=None, point_teacher_state=None):
     if not isinstance(point_teacher, dict):
         return targets
     bag_cfg = point_teacher.get("Bag", None) or point_teacher.get("bag", None) or {}
@@ -208,6 +326,15 @@ def _ensure_point_teacher_bag(targets, point_teacher, model_inputs=None):
     aspect_ratios = bag_cfg.get("aspect_ratios", [1.0])
     wh_px_list = bag_cfg.get("wh_px", [])
     jitter = float(bag_cfg.get("jitter", 0.0))
+    dspe_cfg = point_teacher.get("DSPE", None) or point_teacher.get("dspe", None) or {}
+    dspe_enabled = isinstance(dspe_cfg, dict) and bool(dspe_cfg.get("enabled", False))
+    scale_bank = None
+    if dspe_enabled and isinstance(point_teacher_state, dict):
+        scale_bank = point_teacher_state.get("scale_bank", None)
+    explore_ratio = float(dspe_cfg.get("explore_ratio", 0.5)) if dspe_enabled else 0.0
+    explore_wh_px = dspe_cfg.get("explore_wh_px", wh_px_list) if dspe_enabled else wh_px_list
+    min_wh_px = float(dspe_cfg.get("pseudo_min_wh_px", 2.0)) if dspe_enabled else 1.0
+    max_wh_px = float(dspe_cfg.get("pseudo_max_wh_px", 256.0)) if dspe_enabled else 1e6
     if wh_px_list:
         wh_pool = []
         for it in wh_px_list:
@@ -238,8 +365,20 @@ def _ensure_point_teacher_bag(targets, point_teacher, model_inputs=None):
         cand_wh[:, 0, 0] = (wh_base[:, 0] * w_img).clamp(min=1.0)
         cand_wh[:, 0, 1] = (wh_base[:, 1] * h_img).clamp(min=1.0)
         for i in range(n):
+            if dspe_enabled and isinstance(scale_bank, _ScaleMemoryBank):
+                wh_pool = scale_bank.sample_wh_pool(
+                    label=int(labels[i].item()),
+                    k=max(1, m),
+                    explore_ratio=explore_ratio,
+                    explore_wh_px=explore_wh_px,
+                    min_wh_px=min_wh_px,
+                    max_wh_px=max_wh_px,
+                    device=boxes.device,
+                )
             for j in range(1, m):
-                if wh_pool is None:
+                if dspe_enabled and isinstance(scale_bank, _ScaleMemoryBank):
+                    wi, hi = wh_pool[j]
+                elif wh_pool is None:
                     wi = float(cand_wh[i, 0, 0].item())
                     hi = float(cand_wh[i, 0, 1].item())
                 else:
@@ -265,7 +404,7 @@ def _ensure_point_teacher_bag(targets, point_teacher, model_inputs=None):
     return out
 
 
-def _build_point_pseudo_targets(teacher_outputs, targets, point_sup, use_focal_loss: bool, model_inputs=None, writer: SummaryWriter = None, global_step: int = 0):
+def _build_point_pseudo_targets(teacher_outputs, targets, point_sup, use_focal_loss: bool, model_inputs=None, writer: SummaryWriter = None, global_step: int = 0, point_teacher=None, point_teacher_state=None):
     pred_boxes = teacher_outputs["pred_boxes"].detach()
     pred_logits = teacher_outputs["pred_logits"].detach()
     w_point = float(point_sup.get("cost_point", 1.0))
@@ -279,6 +418,18 @@ def _build_point_pseudo_targets(teacher_outputs, targets, point_sup, use_focal_l
     bs = pred_boxes.shape[0]
     total_gt_points = torch.zeros((), dtype=torch.float32, device=pred_boxes.device)
     total_pseudo = torch.zeros((), dtype=torch.float32, device=pred_boxes.device)
+    h_img, w_img = _extract_hw_from_model_inputs(model_inputs) if model_inputs is not None else (640, 640)
+    h_img = float(max(1, h_img))
+    w_img = float(max(1, w_img))
+    dspe_cfg = point_teacher.get("DSPE", None) if isinstance(point_teacher, dict) else None
+    dspe_cfg = dspe_cfg if isinstance(dspe_cfg, dict) else {}
+    update_beta = float(dspe_cfg.get("update_beta", 0.001))
+    update_score_thresh = float(dspe_cfg.get("update_score_thresh", 0.2))
+    pseudo_min_wh_px = float(dspe_cfg.get("pseudo_min_wh_px", 2.0))
+    pseudo_max_wh_px = float(dspe_cfg.get("pseudo_max_wh_px", 256.0))
+    scale_bank = None
+    if _is_point_teacher_dspe_enabled(point_teacher) and isinstance(point_teacher_state, dict):
+        scale_bank = point_teacher_state.get("scale_bank", None)
     for b in range(bs):
         t = targets[b]
         pts = t["boxes"][..., :2].detach().float()
@@ -326,6 +477,18 @@ def _build_point_pseudo_targets(teacher_outputs, targets, point_sup, use_focal_l
         t_new["boxes"] = kept_boxes
         t_new["labels"] = kept_labels
         pseudo_targets.append(t_new)
+        if isinstance(scale_bank, _ScaleMemoryBank) and kept_boxes.numel() > 0:
+            wh_px = kept_boxes[:, 2:].detach().float()
+            wh_px = torch.stack([wh_px[:, 0] * w_img, wh_px[:, 1] * h_img], dim=1)
+            scale_bank.update(
+                kept_labels.detach(),
+                wh_px,
+                scores=selected_scores[keep].detach() if selected_scores.numel() > 0 else None,
+                beta=update_beta,
+                score_thresh=update_score_thresh,
+                min_wh_px=pseudo_min_wh_px,
+                max_wh_px=pseudo_max_wh_px,
+            )
     if writer is not None and dist_utils.is_main_process() and global_step % 200 == 0:
         writer.add_scalar("PointSup/gt_points_per_iter", float(total_gt_points.item()), global_step)
         writer.add_scalar("PointSup/pseudo_boxes_per_iter", float(total_pseudo.item()), global_step)
@@ -386,6 +549,7 @@ def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, cri
     verbose_type = kwargs.get('verbose_type', 'origin') # 显示方式  
     point_sup = kwargs.get("point_sup", None)
     point_teacher = kwargs.get("point_teacher", None)
+    point_teacher_state = kwargs.get("point_teacher_state", None)
     use_focal_loss = bool(kwargs.get("use_focal_loss", True))
     header = 'Epoch: {}/{}'.format(epoch, epoches)  # 训练过程的日志标题
      
@@ -431,8 +595,8 @@ def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, cri
                         student_inputs = _random_block_mask(model_inputs, point_teacher.get("RandomMask", None) if isinstance(point_teacher, dict) else None)
                         burn_in_steps = int(point_teacher.get("burn_in_steps", 0) or 0) if isinstance(point_teacher, dict) else 0
                         if burn_in_steps > 0 and int(global_step) < burn_in_steps:
-                            targets_for_train = _build_point_fixed_targets(targets, point_teacher, model_inputs=model_inputs)
-                            targets_for_train = _ensure_point_teacher_bag(targets_for_train, point_teacher, model_inputs=model_inputs)
+                            targets_for_train = _build_point_fixed_targets(targets, point_teacher, model_inputs=model_inputs, point_teacher_state=point_teacher_state)
+                            targets_for_train = _ensure_point_teacher_bag(targets_for_train, point_teacher, model_inputs=model_inputs, point_teacher_state=point_teacher_state)
                         elif _is_point_supervision_enabled(point_sup):
                             if ema is None:
                                 raise RuntimeError("PointTeacher requires EMA teacher. Set use_ema=True.")
@@ -452,8 +616,10 @@ def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, cri
                                 model_inputs=model_inputs,
                                 writer=writer,
                                 global_step=global_step,
+                                point_teacher=point_teacher,
+                                point_teacher_state=point_teacher_state,
                             )
-                            targets_for_train = _ensure_point_teacher_bag(targets_for_train, point_teacher, model_inputs=model_inputs)
+                            targets_for_train = _ensure_point_teacher_bag(targets_for_train, point_teacher, model_inputs=model_inputs, point_teacher_state=point_teacher_state)
                     outputs = model(student_inputs, targets=targets_for_train)     
  
             # 处理异常情况，避免 NaN 或 Inf 影响训练 
@@ -494,8 +660,8 @@ def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, cri
                     student_inputs = _random_block_mask(model_inputs, point_teacher.get("RandomMask", None) if isinstance(point_teacher, dict) else None)
                     burn_in_steps = int(point_teacher.get("burn_in_steps", 0) or 0) if isinstance(point_teacher, dict) else 0
                     if burn_in_steps > 0 and int(global_step) < burn_in_steps:
-                        targets_for_train = _build_point_fixed_targets(targets, point_teacher, model_inputs=model_inputs)
-                        targets_for_train = _ensure_point_teacher_bag(targets_for_train, point_teacher, model_inputs=model_inputs)
+                        targets_for_train = _build_point_fixed_targets(targets, point_teacher, model_inputs=model_inputs, point_teacher_state=point_teacher_state)
+                        targets_for_train = _ensure_point_teacher_bag(targets_for_train, point_teacher, model_inputs=model_inputs, point_teacher_state=point_teacher_state)
                     elif _is_point_supervision_enabled(point_sup):
                         if ema is None:
                             raise RuntimeError("PointTeacher requires EMA teacher. Set use_ema=True.")
@@ -515,8 +681,10 @@ def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, cri
                             model_inputs=model_inputs,
                             writer=writer,
                             global_step=global_step,
+                            point_teacher=point_teacher,
+                            point_teacher_state=point_teacher_state,
                         )
-                        targets_for_train = _ensure_point_teacher_bag(targets_for_train, point_teacher, model_inputs=model_inputs)
+                        targets_for_train = _ensure_point_teacher_bag(targets_for_train, point_teacher, model_inputs=model_inputs, point_teacher_state=point_teacher_state)
                 outputs = model(student_inputs, targets=targets_for_train)  # 前向传播     
             with dt[2]: 
                 loss_dict = criterion(outputs, targets_for_train, **metas)  # 计算损失   

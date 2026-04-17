@@ -17,7 +17,7 @@ import torch
 from ..misc import dist_utils, stats, get_weight_size     
 
 from ._solver import BaseSolver, ModelSaverFunc  
-from .det_engine import train_one_epoch, distill_one_epoch, evaluate
+from .det_engine import train_one_epoch, distill_one_epoch, evaluate, _ScaleMemoryBank
 from .sample_adapter import move_samples_to_device, select_model_input, select_model_input_for_model
 from ..optim.lr_scheduler import FlatCosineLRScheduler 
 from ..logger_module import get_logger
@@ -105,6 +105,7 @@ class DetSolver(BaseSolver):
         point_teacher = self.cfg.yaml_cfg.get("PointTeacher", None)
         point_teacher_enabled = isinstance(point_teacher, dict) and point_teacher.get("enabled", False)
         point_sup = self.cfg.yaml_cfg.get("PointSupervision", None)
+        point_teacher_state = None
         if point_teacher_enabled:
             if not isinstance(point_sup, dict):
                 point_sup = {}
@@ -119,6 +120,15 @@ class DetSolver(BaseSolver):
                         setattr(m, "num_denoising", 0)
                     except Exception:
                         pass
+            dspe_cfg = point_teacher.get("DSPE", None) or point_teacher.get("dspe", None) or {}
+            if isinstance(dspe_cfg, dict) and dspe_cfg.get("enabled", False):
+                num_classes = int(self.cfg.yaml_cfg.get("num_classes", 0) or 0)
+                if num_classes > 0:
+                    init_mean = dspe_cfg.get("init_mean_wh_px", point_teacher.get("fixed_box_wh_px", (20.0, 20.0)))
+                    init_std = dspe_cfg.get("init_std_wh_px", dspe_cfg.get("init_mean_wh_px", (20.0, 20.0)))
+                    min_std = dspe_cfg.get("min_std_px", (0.35, 0.35))
+                    bank = _ScaleMemoryBank(num_classes=num_classes, init_mean_wh_px=init_mean, init_std_wh_px=init_std, min_std_px=min_std)
+                    point_teacher_state = {"scale_bank": bank, "num_classes": num_classes}
 
         if dist_utils.is_main_process():     
             with open(self.output_dir / 'args.json', 'w') as json_file:
@@ -199,6 +209,7 @@ class DetSolver(BaseSolver):
                 verbose_type=args.verbose_type,
                 point_sup=point_sup,
                 point_teacher=point_teacher,
+                point_teacher_state=point_teacher_state,
             )
 
             if torch.cuda.is_available():     
