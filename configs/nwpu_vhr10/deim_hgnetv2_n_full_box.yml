@@ -1,0 +1,36 @@
+__include__: [
+  '../../../DEIM/configs/dfine/dfine_hgnetv2_n_custom.yml'
+]
+
+output_dir: outputs/nwpu_vhr10_full_box
+
+num_classes: 10
+remap_mscoco_category: False
+
+# ================= 🚀 核心优化修改区 =================
+epoches: 120           # 基准训练轮数从 60 延长至 120，给模型充分的时间收敛
+flat_epoch: 60         # 保持前 60 轮（Warmup 结束后）为恒定学习率
+no_aug_epoch: 15       # 最后 15 轮关闭强数据增强（Mosaics等），进行微调
+lr_gamma: 0.1          # 允许后续阶段进行梯度或学习率的区间衰减（如必要）
+# ===================================================
+
+train_dataloader:
+  total_batch_size: 16
+  num_workers: 4
+  dataset:
+    type: CocoDetection
+    img_folder: dataset/nwpu_vhr10/images/train
+    ann_file: dataset/nwpu_vhr10/annotations/instances_train.json
+    transforms:
+      policy:
+        epoch: 112     # 同步修改：在总轮数（120）减去 no_aug_epoch（15）的前后开始切换策略（通常设为 epoches - no_aug_epoch）
+  collate_fn:
+    stop_epoch: 112    # 同步修改：与上面 transforms 的 epoch 保持一致
+
+val_dataloader:
+  total_batch_size: 8
+  num_workers: 4
+  dataset:
+    type: CocoDetection
+    img_folder: dataset/nwpu_vhr10/images/val
+    ann_file: dataset/nwpu_vhr10/annotations/instances_val.json
