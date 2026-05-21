@@ -1,19 +1,16 @@
 __include__: [
-  '../../../DEIM/configs/dfine/dfine_hgnetv2_n_custom.yml'
+  '../../DEIM/configs/dfine/dfine_hgnetv2_n_custom.yml'
 ]
 
-# 建议修改输出目录名称，方便与全监督区分
 output_dir: outputs/nwpu_vhr10_point_only_enhanced
 
 num_classes: 10
 remap_mscoco_category: False
 
-# ================= 🚀 核心优化修改区 =================
-epoches: 140           # 点监督必须拉长生命周期！从 60 轮大幅提升至 140 轮
-flat_epoch: 80         # 给伪框生成机制（Pseudo Box Generation）留出前 80 轮进行高强度高学习率探索
-no_aug_epoch: 20       # 最后 20 轮完全关闭强数据增强，让伪框在稳定真实的遥感背景下进行极致微调
+epoches: 140
+flat_epoch: 80
+no_aug_epoch: 20
 lr_gamma: 0.1
-# ===================================================
 
 criterion: PointSupDEIMCriterionV2
 
@@ -30,10 +27,13 @@ PointSupDEIMCriterionV2:
     gamma: 2.0
   pseudo_box:
     memory_size: 3
-    # 核心点监督微调：将伪框预热轮数稍微拉长（原为 4），给类别无关的几何粗定位更多时间稳定
-    class_agnostic_warmup_epochs: 6  
-    density_recall_penalty: 1.1
-    density_precision_penalty: 1.3
+    prior_wh: 0.20
+    min_wh: 0.015
+    score_thresh: 0.15
+    center_radius: 0.10
+    class_agnostic_warmup_epochs: 10
+    density_recall_penalty: 1.5
+    density_precision_penalty: 1.1
     mask_point_sample_ratio: 8
 
 train_dataloader:
@@ -45,14 +45,14 @@ train_dataloader:
     ann_file: dataset/nwpu_vhr10/annotations/instances_train.json
     transforms:
       policy:
-        epoch: 120     # 同步修改：总轮数 140 - no_aug_epoch 20 = 120 轮时切换策略
+        epoch: 120
     point_mode: center
     drop_boxes: True
     prior_wh: 0.20
-    min_wh: 0.02
+    min_wh: 0.015
     max_wh: 0.90
   collate_fn:
-    stop_epoch: 120    # 同步修改：必须与上面 transforms 的 epoch 保持绝对一致
+    stop_epoch: 120
 
 val_dataloader:
   total_batch_size: 8

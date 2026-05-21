@@ -106,6 +106,7 @@ class PointSupDEIMCriterionV2(DEIMCriterion):
         pred_boxes = outputs_without_aux["pred_boxes"]
 
         matched = 0
+        n_pts = int(sum(int(t["points"].shape[0]) for t in targets))
         for b, (src_idx, tgt_idx) in enumerate(indices):
             if tgt_idx.numel() == 0:
                 continue
@@ -152,4 +153,12 @@ class PointSupDEIMCriterionV2(DEIMCriterion):
                     f"score_thresh={float(self.pseudo_box_cfg.score_thresh):.3f}"
                 )
 
+        losses.update(
+            {
+                "point_matched": torch.as_tensor(float(matched), device=device),
+                "point_num_points": torch.as_tensor(float(n_pts), device=device),
+                "point_match_ratio": torch.as_tensor(float(matched) / float(max(1, n_pts)), device=device),
+                "pseudo_score_thresh": torch.as_tensor(float(self.pseudo_box_memory.cfg.score_thresh), device=device),
+            }
+        )
         return losses

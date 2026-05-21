@@ -1,0 +1,10 @@
+__include__: [
+  './deim_hgnetv2_n_point_only_smallobj_all_gated_v2.yml'
+]
+
+output_dir: outputs/nwpu_vhr10_point_only_smallobj_all_gated_v2_hgpre
+
+HGNetv2:
+  pretrained: True
+  local_model_dir: ./weight/hgnetv2/
+

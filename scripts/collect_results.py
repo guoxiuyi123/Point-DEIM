@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 
 COCO_BBOX_NAMES = ["ap", "ap50", "ap75", "aps", "apm", "apl", "ar", "ar50", "ar75", "ars", "arm", "arl"]
+DIAG_KEYS = ["point_match_ratio", "point_matched", "point_num_points", "pseudo_score_thresh"]
 
 
 def _safe_float(x: Any) -> Optional[float]:
@@ -36,10 +37,11 @@ def _read_jsonl(path: Path) -> List[Dict[str, Any]]:
     return rows
 
 
-def _best_by_ap(rows: List[Dict[str, Any]]) -> Tuple[Optional[Dict[str, Any]], Optional[float]]:
+def _best_by_ap(rows: List[Dict[str, Any]]) -> Tuple[Optional[Dict[str, Any]], Optional[float], Optional[int]]:
     best_row = None
     best_ap = None
-    for r in rows:
+    best_idx = None
+    for i, r in enumerate(rows):
         stats = _extract_coco_stats(r)
         ap = stats[0] if stats and len(stats) > 0 else None
         if ap is None:
@@ -47,7 +49,26 @@ def _best_by_ap(rows: List[Dict[str, Any]]) -> Tuple[Optional[Dict[str, Any]], O
         if best_ap is None or ap > best_ap:
             best_ap = ap
             best_row = r
-    return best_row, best_ap
+            best_idx = i
+
+    return best_row, best_ap, best_idx
+
+
+def _last_scalar_before(rows: List[Dict[str, Any]], last_i: int, key: str) -> Optional[float]:
+    last_i = min(last_i, len(rows) - 1)
+    for i in range(last_i, -1, -1):
+        v = _safe_float(rows[i].get(key))
+        if v is not None:
+            return v
+    return None
+
+
+def _last_scalar_before_any(rows: List[Dict[str, Any]], last_i: int, keys: List[str]) -> Optional[float]:
+    for k in keys:
+        v = _last_scalar_before(rows, last_i, k)
+        if v is not None:
+            return v
+    return None
 
 
 def collect(outputs_dir: Path) -> List[Dict[str, Any]]:
@@ -55,7 +76,7 @@ def collect(outputs_dir: Path) -> List[Dict[str, Any]]:
     for log_path in outputs_dir.rglob("log.txt"):
         exp_dir = log_path.parent
         rows = _read_jsonl(log_path)
-        best_row, best_ap = _best_by_ap(rows)
+        best_row, best_ap, best_row_i = _best_by_ap(rows)
         last_row = rows[-1] if rows else None
 
         item: Dict[str, Any] = {
@@ -71,6 +92,15 @@ def collect(outputs_dir: Path) -> List[Dict[str, Any]]:
             item["best_coco_eval_bbox"] = best_stats
             item["best_coco_eval_bbox_named"] = {
                 COCO_BBOX_NAMES[i]: best_stats[i] for i in range(min(len(best_stats), len(COCO_BBOX_NAMES)))
+            }
+
+        if rows:
+            best_i = best_row_i if best_row_i is not None else (len(rows) - 1)
+            item["best_diag"] = {
+                k: _last_scalar_before_any(rows, best_i, [k, f"train_{k}"]) for k in DIAG_KEYS
+            }
+            item["last_diag"] = {
+                k: _last_scalar_before_any(rows, len(rows) - 1, [k, f"train_{k}"]) for k in DIAG_KEYS
             }
 
         args_json = exp_dir / "args.json"
@@ -107,4 +137,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

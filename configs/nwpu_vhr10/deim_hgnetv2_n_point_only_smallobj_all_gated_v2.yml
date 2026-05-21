@@ -1,0 +1,33 @@
+__include__: [
+  './deim_hgnetv2_n_point_only_smallobj_all.yml'
+]
+
+output_dir: outputs/nwpu_vhr10_point_only_smallobj_all_gated_v2
+
+PointSupDEIMCriterionScaleAdaptiveInitScoreThreshSchedule:
+  pseudo_box:
+    prior_wh: 0.03
+    min_wh: 0.005
+    max_wh: 0.20
+    ema: 0.95
+    score_thresh: 0.25
+    center_radius: 0.02
+    class_agnostic_warmup_epochs: 2
+    require_point_inside: True
+    max_scale_up: 1.8
+    max_scale_down: 0.2
+    density_recall_penalty: 1.5
+    density_precision_penalty: 1.1
+  adaptive_k: 1
+  adaptive_scale: 0.15
+  score_thresh_start: 0.50
+  score_thresh_end: 0.25
+  score_thresh_begin_epoch: 0
+  score_thresh_end_epoch: 36
+
+train_dataloader:
+  dataset:
+    prior_wh: 0.03
+    min_wh: 0.005
+    max_wh: 0.20
+

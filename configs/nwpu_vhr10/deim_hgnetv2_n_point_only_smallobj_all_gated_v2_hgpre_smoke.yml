@@ -1,0 +1,27 @@
+__include__: [
+  './deim_hgnetv2_n_point_only_smallobj_all_gated_v2_hgpre.yml'
+]
+
+output_dir: outputs/nwpu_vhr10_point_only_smallobj_all_gated_v2_hgpre_smoke
+
+epoches: 2
+flat_epoch: 1
+no_aug_epoch: 0
+
+train_dataloader:
+  total_batch_size: 4
+  num_workers: 2
+  dataset:
+    ann_file: dataset/nwpu_vhr10/annotations/instances_train_smoke.json
+    transforms:
+      policy:
+        epoch: 2
+  collate_fn:
+    stop_epoch: 2
+
+val_dataloader:
+  total_batch_size: 4
+  num_workers: 2
+  dataset:
+    ann_file: dataset/nwpu_vhr10/annotations/instances_val_smoke.json
+
