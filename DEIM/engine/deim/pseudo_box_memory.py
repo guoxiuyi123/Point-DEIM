@@ -13,6 +13,10 @@ class PseudoBoxConfig:
     max_wh: float = 0.9
     ema: float = 0.9
     score_thresh: float = 0.3
+    score_topk: int = 0
+    score_topk_begin_epoch: int = 0
+    score_topk_end_epoch: int = -1
+    update_end_epoch: int = -1
     center_radius: float = 0.08
     class_agnostic_warmup_epochs: int = 3
     require_point_inside: bool = False
@@ -58,6 +62,9 @@ class PseudoBoxMemory:
                 "clip_down": 0.0,
                 "mean_max_scale_ok": 0.0,
                 "mean_area_ratio_ok": 0.0,
+                "score_topk_used": 0.0,
+                "score_thresh_eff": float(self.cfg.score_thresh),
+                "frozen": 0.0,
             }
 
         pb = self._mem.get(sample_idx)
@@ -79,7 +86,20 @@ class PseudoBoxMemory:
         d = (pred_centers - tgt_pts).abs().sum(-1)
 
         radius_ok = d <= cfg.center_radius
-        score_ok = pred_scores >= cfg.score_thresh
+        score_thresh_eff = float(cfg.score_thresh)
+        score_ok = pred_scores >= score_thresh_eff
+        score_topk_used = False
+        score_topk = int(getattr(cfg, "score_topk", 0))
+        if score_topk > 0:
+            b = int(getattr(cfg, "score_topk_begin_epoch", 0))
+            e = int(getattr(cfg, "score_topk_end_epoch", -1))
+            if int(epoch) >= b and (e < 0 or int(epoch) <= e) and int(score_ok.sum().item()) == 0:
+                k = min(int(score_topk), int(pred_scores.numel()))
+                if k > 0:
+                    topk_idx = pred_scores.topk(k=k, largest=True).indices
+                    score_ok = torch.zeros_like(score_ok, dtype=torch.bool)
+                    score_ok[topk_idx] = True
+                    score_topk_used = True
         inside_ok = torch.ones_like(score_ok, dtype=torch.bool)
         if bool(cfg.require_point_inside):
             half = pred_boxes[:, 2:] * 0.5
@@ -135,6 +155,27 @@ class PseudoBoxMemory:
                 "clip_down": float(n_clip_down),
                 "mean_max_scale_ok": float(mean_max_scale_ok),
                 "mean_area_ratio_ok": float(mean_area_ratio_ok),
+                "score_topk_used": float(1.0 if score_topk_used else 0.0),
+                "score_thresh_eff": float(score_thresh_eff),
+                "frozen": 0.0,
+            }
+
+        update_end_epoch = int(getattr(cfg, "update_end_epoch", -1))
+        if update_end_epoch >= 0 and int(epoch) > update_end_epoch:
+            return {
+                "total": float(total),
+                "radius_ok": float(n_radius),
+                "score_ok": float(n_score),
+                "inside_ok": float(n_inside),
+                "wh_ok": float(n_wh),
+                "ok": float(n_ok),
+                "clip_up": float(n_clip_up),
+                "clip_down": float(n_clip_down),
+                "mean_max_scale_ok": float(mean_max_scale_ok),
+                "mean_area_ratio_ok": float(mean_area_ratio_ok),
+                "score_topk_used": float(1.0 if score_topk_used else 0.0),
+                "score_thresh_eff": float(score_thresh_eff),
+                "frozen": 1.0,
             }
 
         ema = float(cfg.ema)
@@ -161,6 +202,9 @@ class PseudoBoxMemory:
             "clip_down": float(n_clip_down),
             "mean_max_scale_ok": float(mean_max_scale_ok),
             "mean_area_ratio_ok": float(mean_area_ratio_ok),
+            "score_topk_used": float(1.0 if score_topk_used else 0.0),
+            "score_thresh_eff": float(score_thresh_eff),
+            "frozen": 0.0,
         }
 
     def _init_from_points(self, points: torch.Tensor) -> torch.Tensor:

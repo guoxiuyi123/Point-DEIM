@@ -1,0 +1,9 @@
+__include__: [
+  './deim_hgnetv2_n_point_only_smallobj_all_gated_v2_hgpre_balanced_v5.yml'
+]
+
+output_dir: outputs/nwpu_vhr10_point_only_smallobj_all_gated_v2_hgpre_balanced_v6
+
+PointSupDEIMCriterionScaleAdaptiveInitScoreThreshSchedule:
+  pseudo_box:
+    score_topk_end_epoch: 10

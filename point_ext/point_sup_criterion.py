@@ -116,6 +116,10 @@ class PointSupDEIMCriterionV2(DEIMCriterion):
         upd_clip_down = 0.0
         upd_sum_mean_max_scale_ok = 0.0
         upd_sum_mean_area_ratio_ok = 0.0
+        upd_score_topk_used = 0.0
+        upd_sum_score_thresh_eff = 0.0
+        upd_images = 0.0
+        upd_frozen_images = 0.0
         n_pts = int(sum(int(t["points"].shape[0]) for t in targets))
         for b, (src_idx, tgt_idx) in enumerate(indices):
             if tgt_idx.numel() == 0:
@@ -148,6 +152,7 @@ class PointSupDEIMCriterionV2(DEIMCriterion):
                 points=pseudo_targets[b]["points"],
                 epoch=epoch,
             )
+            upd_images += 1.0
             upd_total += float(upd["total"])
             upd_radius_ok += float(upd["radius_ok"])
             upd_score_ok += float(upd["score_ok"])
@@ -158,6 +163,11 @@ class PointSupDEIMCriterionV2(DEIMCriterion):
             upd_clip_down += float(upd["clip_down"])
             upd_sum_mean_max_scale_ok += float(upd["mean_max_scale_ok"]) * float(upd["ok"])
             upd_sum_mean_area_ratio_ok += float(upd["mean_area_ratio_ok"]) * float(upd["ok"])
+            upd_score_topk_used += float(upd.get("score_topk_used", 0.0))
+            upd_sum_score_thresh_eff += float(upd.get("score_thresh_eff", float(self.pseudo_box_memory.cfg.score_thresh))) * float(
+                upd["total"]
+            )
+            upd_frozen_images += float(upd.get("frozen", 0.0))
 
         step = kwargs.get("step", None)
         if step is not None:
@@ -170,7 +180,7 @@ class PointSupDEIMCriterionV2(DEIMCriterion):
                 ratio = float(matched) / float(max(1, n_pts))
                 print(
                     f"[PointSup] epoch={epoch} step={s} matched={matched} points={n_pts} ratio={ratio:.3f} "
-                    f"score_thresh={float(self.pseudo_box_cfg.score_thresh):.3f}"
+                    f"score_thresh={float(self.pseudo_box_memory.cfg.score_thresh):.3f}"
                 )
 
         losses.update(
@@ -199,6 +209,13 @@ class PointSupDEIMCriterionV2(DEIMCriterion):
                 "pseudo_update_mean_area_ratio_ok": torch.as_tensor(
                     float(upd_sum_mean_area_ratio_ok) / float(max(1.0, upd_ok)), device=device
                 ),
+                "pseudo_update_score_topk_used_ratio": torch.as_tensor(
+                    float(upd_score_topk_used) / float(max(1.0, upd_images)), device=device
+                ),
+                "pseudo_update_score_thresh_eff": torch.as_tensor(
+                    float(upd_sum_score_thresh_eff) / float(max(1.0, upd_total)), device=device
+                ),
+                "pseudo_update_frozen_ratio": torch.as_tensor(float(upd_frozen_images) / float(max(1.0, upd_images)), device=device),
             }
         )
         return losses

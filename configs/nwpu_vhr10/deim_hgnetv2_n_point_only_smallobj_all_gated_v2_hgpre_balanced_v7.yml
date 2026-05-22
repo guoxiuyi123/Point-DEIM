@@ -1,0 +1,11 @@
+__include__: [
+  './deim_hgnetv2_n_point_only_smallobj_all_gated_v2_hgpre_balanced_v6.yml'
+]
+
+output_dir: outputs/nwpu_vhr10_point_only_smallobj_all_gated_v2_hgpre_balanced_v7
+
+PointSupDEIMCriterionScaleAdaptiveInitScoreThreshSchedule:
+  max_scale_up_start: 2.5
+  max_scale_up_end: 1.6
+  max_scale_up_begin_epoch: 0
+  max_scale_up_end_epoch: 60
