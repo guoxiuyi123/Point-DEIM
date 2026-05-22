@@ -205,6 +205,14 @@ class PointSupDEIMCriterionScaleAdaptiveInitScoreThreshSchedule(PointSupDEIMCrit
         score_thresh_end: float = 0.3,
         score_thresh_begin_epoch: int = 0,
         score_thresh_end_epoch: int = 12,
+        center_radius_start: float | None = None,
+        center_radius_end: float | None = None,
+        center_radius_begin_epoch: int = 0,
+        center_radius_end_epoch: int = 12,
+        max_scale_up_start: float | None = None,
+        max_scale_up_end: float | None = None,
+        max_scale_up_begin_epoch: int = 0,
+        max_scale_up_end_epoch: int = 12,
         adaptive_k: int = 1,
         adaptive_scale: float = 0.6,
         pseudo_box=None,
@@ -222,6 +230,16 @@ class PointSupDEIMCriterionScaleAdaptiveInitScoreThreshSchedule(PointSupDEIMCrit
         self._score_thresh_begin_epoch = int(score_thresh_begin_epoch)
         self._score_thresh_end_epoch = int(score_thresh_end_epoch)
 
+        self._center_radius_start = None if center_radius_start is None else float(center_radius_start)
+        self._center_radius_end = None if center_radius_end is None else float(center_radius_end)
+        self._center_radius_begin_epoch = int(center_radius_begin_epoch)
+        self._center_radius_end_epoch = int(center_radius_end_epoch)
+
+        self._max_scale_up_start = None if max_scale_up_start is None else float(max_scale_up_start)
+        self._max_scale_up_end = None if max_scale_up_end is None else float(max_scale_up_end)
+        self._max_scale_up_begin_epoch = int(max_scale_up_begin_epoch)
+        self._max_scale_up_end_epoch = int(max_scale_up_end_epoch)
+
     def _score_thresh_at(self, epoch: int) -> float:
         b = int(self._score_thresh_begin_epoch)
         e = int(self._score_thresh_end_epoch)
@@ -234,6 +252,38 @@ class PointSupDEIMCriterionScaleAdaptiveInitScoreThreshSchedule(PointSupDEIMCrit
         t = float(epoch - b) / float(e - b)
         return float(self._score_thresh_start + t * (self._score_thresh_end - self._score_thresh_start))
 
+    def _linear_at(self, epoch: int, start: float, end: float, begin_epoch: int, end_epoch: int) -> float:
+        b = int(begin_epoch)
+        e = int(end_epoch)
+        if e <= b:
+            return float(end)
+        if epoch <= b:
+            return float(start)
+        if epoch >= e:
+            return float(end)
+        t = float(epoch - b) / float(e - b)
+        return float(start + t * (end - start))
+
     def set_epoch(self, epoch):
         super().set_epoch(epoch)
         self.pseudo_box_memory.cfg.score_thresh = float(self._score_thresh_at(int(epoch)))
+        if self._center_radius_start is not None and self._center_radius_end is not None:
+            self.pseudo_box_memory.cfg.center_radius = float(
+                self._linear_at(
+                    int(epoch),
+                    self._center_radius_start,
+                    self._center_radius_end,
+                    self._center_radius_begin_epoch,
+                    self._center_radius_end_epoch,
+                )
+            )
+        if self._max_scale_up_start is not None and self._max_scale_up_end is not None:
+            self.pseudo_box_memory.cfg.max_scale_up = float(
+                self._linear_at(
+                    int(epoch),
+                    self._max_scale_up_start,
+                    self._max_scale_up_end,
+                    self._max_scale_up_begin_epoch,
+                    self._max_scale_up_end_epoch,
+                )
+            )

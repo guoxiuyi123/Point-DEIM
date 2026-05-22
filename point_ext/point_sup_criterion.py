@@ -106,6 +106,16 @@ class PointSupDEIMCriterionV2(DEIMCriterion):
         pred_boxes = outputs_without_aux["pred_boxes"]
 
         matched = 0
+        upd_total = 0.0
+        upd_radius_ok = 0.0
+        upd_score_ok = 0.0
+        upd_inside_ok = 0.0
+        upd_wh_ok = 0.0
+        upd_ok = 0.0
+        upd_clip_up = 0.0
+        upd_clip_down = 0.0
+        upd_sum_mean_max_scale_ok = 0.0
+        upd_sum_mean_area_ratio_ok = 0.0
         n_pts = int(sum(int(t["points"].shape[0]) for t in targets))
         for b, (src_idx, tgt_idx) in enumerate(indices):
             if tgt_idx.numel() == 0:
@@ -130,7 +140,7 @@ class PointSupDEIMCriterionV2(DEIMCriterion):
                 else:
                     scores = prob.gather(1, labels[:, None]).squeeze(1)
 
-            self.pseudo_box_memory.update(
+            upd = self.pseudo_box_memory.update(
                 sample_idx=sample_idx,
                 tgt_indices=tgt_idx,
                 pred_boxes=pred_boxes[b][src_idx],
@@ -138,6 +148,16 @@ class PointSupDEIMCriterionV2(DEIMCriterion):
                 points=pseudo_targets[b]["points"],
                 epoch=epoch,
             )
+            upd_total += float(upd["total"])
+            upd_radius_ok += float(upd["radius_ok"])
+            upd_score_ok += float(upd["score_ok"])
+            upd_inside_ok += float(upd["inside_ok"])
+            upd_wh_ok += float(upd["wh_ok"])
+            upd_ok += float(upd["ok"])
+            upd_clip_up += float(upd["clip_up"])
+            upd_clip_down += float(upd["clip_down"])
+            upd_sum_mean_max_scale_ok += float(upd["mean_max_scale_ok"]) * float(upd["ok"])
+            upd_sum_mean_area_ratio_ok += float(upd["mean_area_ratio_ok"]) * float(upd["ok"])
 
         step = kwargs.get("step", None)
         if step is not None:
@@ -159,6 +179,26 @@ class PointSupDEIMCriterionV2(DEIMCriterion):
                 "point_num_points": torch.as_tensor(float(n_pts), device=device),
                 "point_match_ratio": torch.as_tensor(float(matched) / float(max(1, n_pts)), device=device),
                 "pseudo_score_thresh": torch.as_tensor(float(self.pseudo_box_memory.cfg.score_thresh), device=device),
+                "pseudo_update_total": torch.as_tensor(float(upd_total), device=device),
+                "pseudo_update_ok_ratio": torch.as_tensor(float(upd_ok) / float(max(1.0, upd_total)), device=device),
+                "pseudo_update_radius_ok_ratio": torch.as_tensor(
+                    float(upd_radius_ok) / float(max(1.0, upd_total)), device=device
+                ),
+                "pseudo_update_score_ok_ratio": torch.as_tensor(float(upd_score_ok) / float(max(1.0, upd_total)), device=device),
+                "pseudo_update_inside_ok_ratio": torch.as_tensor(
+                    float(upd_inside_ok) / float(max(1.0, upd_total)), device=device
+                ),
+                "pseudo_update_wh_ok_ratio": torch.as_tensor(float(upd_wh_ok) / float(max(1.0, upd_total)), device=device),
+                "pseudo_update_clip_up_ratio": torch.as_tensor(float(upd_clip_up) / float(max(1.0, upd_total)), device=device),
+                "pseudo_update_clip_down_ratio": torch.as_tensor(
+                    float(upd_clip_down) / float(max(1.0, upd_total)), device=device
+                ),
+                "pseudo_update_mean_max_scale_ok": torch.as_tensor(
+                    float(upd_sum_mean_max_scale_ok) / float(max(1.0, upd_ok)), device=device
+                ),
+                "pseudo_update_mean_area_ratio_ok": torch.as_tensor(
+                    float(upd_sum_mean_area_ratio_ok) / float(max(1.0, upd_ok)), device=device
+                ),
             }
         )
         return losses
