@@ -2,37 +2,52 @@ __include__: [
   './deim_hgnetv2_n_point_only_smallobj_all_gated_v2.yml'
 ]
 
-output_dir: outputs/nwpu_vhr10_point_only_smallobj_all_gated_v2_hgpre_balanced_v2
+output_dir: outputs/nwpu_vhr10_point_only_smallobj_all_gated_v2_ptteacher_v1
 
 HGNetv2:
   pretrained: True
   local_model_dir: ./weight/hgnetv2/
 
 PointSupDEIMCriterionScaleAdaptiveInitScoreThreshSchedule:
-  density_recall_penalty: 1.5
-  density_precision_penalty: 1.1
+  update_topk: 5
+  update_use_aux_outputs: True
+  update_use_enc_aux_outputs: False
+  update_use_pre_outputs: False
+  update_burnin_epochs: 4
+  reg_quality_weight: cls_score
+  reg_quality_power: 1.0
   pseudo_box:
     prior_wh: 0.03
     min_wh: 0.005
     max_wh: 0.20
     ema: 0.90
+    score_thresh: 0.25
     center_radius: 0.02
     class_agnostic_warmup_epochs: 4
     require_point_inside: True
-    max_scale_up: 1.8
+    max_scale_up: 1.6
     max_scale_down: 0.2
+    aggregate_by_target: True
+    score_weight_power: 1.0
+    score_topk: 5
+    score_topk_begin_epoch: 0
+    score_topk_end_epoch: 10
+    refine_points: True
+    refine_lamda: 0.5
+    refine_begin_epoch: 0
+    refine_end_epoch: 30
   adaptive_k: 1
   adaptive_scale: 0.15
-  score_thresh_start: 0.50
-  score_thresh_end: 0.25
+  score_thresh_start: 0.25
+  score_thresh_end: 0.15
   score_thresh_begin_epoch: 0
-  score_thresh_end_epoch: 36
+  score_thresh_end_epoch: 20
   center_radius_start: 0.08
   center_radius_end: 0.02
   center_radius_begin_epoch: 0
   center_radius_end_epoch: 30
-  max_scale_up_start: 3.0
-  max_scale_up_end: 1.8
+  max_scale_up_start: 2.5
+  max_scale_up_end: 1.6
   max_scale_up_begin_epoch: 0
   max_scale_up_end_epoch: 60
 

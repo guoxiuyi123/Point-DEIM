@@ -30,7 +30,7 @@ python scripts/prepare_nwpu_vhr10_coco.py \
 ### 2) 跑通 smoke（CPU 也可）
 
 ```bash
-python train.py -c configs/nwpu_vhr10/deim_hgnetv2_n_point_only_smallobj_all_gated_v2_hgpre_smoke.yml --seed 0
+python train.py -c configs/nwpu_vhr10/deim_hgnetv2_n_point_only_smallobj_all_gated_v2_ptteacher_smoke.yml --seed 0
 ```
 
 ### 2.5) （可选）启用 HGNetv2 stage1 预训练
@@ -42,8 +42,8 @@ python train.py -c configs/nwpu_vhr10/deim_hgnetv2_n_point_only_smallobj_all_gat
 使用预训练的 smoke / 正式训练：
 
 ```bash
-python train.py -c configs/nwpu_vhr10/deim_hgnetv2_n_point_only_smallobj_all_gated_v2_hgpre_smoke.yml --seed 0
-python train.py -c configs/nwpu_vhr10/deim_hgnetv2_n_point_only_smallobj_all_gated_v2_hgpre.yml --seed 0
+python train.py -c configs/nwpu_vhr10/deim_hgnetv2_n_point_only_smallobj_all_gated_v2_ptteacher_smoke.yml --seed 0
+python train.py -c configs/nwpu_vhr10/deim_hgnetv2_n_point_only_smallobj_all_gated_v2_ptteacher_v1.yml --seed 0
 ```
 
 ### 3) 跑正式配置（单点监督 / 全监督上限）
@@ -70,8 +70,8 @@ python scripts/vis_pred.py \
 如需绕过 preset 直接用 YAML（等价于 train.py 内部调用），在本目录下运行：
 
 ```bash
-python DEIM/train.py -c configs/nwpu_vhr10/deim_hgnetv2_n_point_only_smallobj_all_gated_v2_hgpre.yml --seed 0
-python DEIM/train.py -c configs/nwpu_vhr10/deim_hgnetv2_n_point_only_smallobj_all_gated_v2_hgpre.yml --test-only -r outputs/nwpu_vhr10_point_only_smallobj_all_gated_v2_hgpre/best_stg1.pth
+python DEIM/train.py -c configs/nwpu_vhr10/deim_hgnetv2_n_point_only_smallobj_all_gated_v2_ptteacher_v1.yml --seed 0
+python DEIM/train.py -c configs/nwpu_vhr10/deim_hgnetv2_n_point_only_smallobj_all_gated_v2_ptteacher_v1.yml --test-only -r outputs/nwpu_vhr10_point_only_smallobj_all_gated_v2_ptteacher_v1/best_stg1.pth
 ```
 
 ### 5) 结果汇总与表格

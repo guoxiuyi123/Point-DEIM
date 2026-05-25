@@ -23,7 +23,7 @@ def _build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("-p", "--path", type=str)
     parser.add_argument("-m", "--mode", type=str, default="det", choices=["det", "mask"])
 
-    parser.add_argument("-u", "--update", nargs="+")
+    parser.add_argument("-u", "--update", nargs="+", action="append")
 
     parser.add_argument("--print-method", type=str, default="builtin")
     parser.add_argument("--print-rank", type=int, default=0)
@@ -75,7 +75,11 @@ def main() -> int:
         overrides["summary_dir"] = args.summary_dir
     if args.path is not None:
         overrides["path"] = args.path
-    overrides.update(parse_cli(args.update))
+    updates = []
+    if args.update:
+        for group in args.update:
+            updates.extend(group)
+    overrides.update(parse_cli(updates))
 
     cfg_path = _resolve_config_path(args.config)
     cfg = YAMLConfig(cfg_path, **overrides)
