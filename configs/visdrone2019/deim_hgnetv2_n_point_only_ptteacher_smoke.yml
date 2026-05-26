@@ -1,0 +1,14 @@
+__include__: [
+  './deim_hgnetv2_n_point_only_ptteacher.yml'
+]
+
+epoches: 2
+flat_epoch: 1
+no_aug_epoch: 1
+
+output_dir: outputs/visdrone2019_point_only_ptteacher_smoke
+
+train_dataloader:
+  dataset:
+    img_folder: dataset/visdrone2019/images_smoke
+    ann_file: dataset/visdrone2019/annotations/instances_train_smoke.json

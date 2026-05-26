@@ -321,11 +321,16 @@ def evaluate(model: torch.nn.Module, criterion: torch.nn.Module, postprocessor, 
             try:
                 logger.info(RED + "------------------------ TIDE Metrice Start ------------------------" + RESET)
                 tide = TIDE()
-                tide.evaluate_range(datasets.COCO(data_loader.dataset.ann_file), datasets.COCOResult(output_dir / 'pred_bbox.json')) 
+                tide.evaluate_range(datasets.COCO(data_loader.dataset.ann_file), datasets.COCOResult(output_dir / 'pred_bbox.json'))
                 tide.summarize()
-                tide.plot(out_dir=output_dir / 'tide_result')
+                tide_out_dir = output_dir / 'tide_result'
+                tide_out_dir.mkdir(parents=True, exist_ok=True)
+                try:
+                    tide.plot(out_dir=tide_out_dir)
+                except Exception as e:
+                    (tide_out_dir / 'plot_error.txt').write_text(str(e), encoding='utf-8')
             except Exception as e:
-                logger.error(RED, 'TIDE failure... skip message:', e, RESET)
+                logger.error(RED + f"TIDE failure... skip message: {e}" + RESET)
                 logger.warning('------------------------ TIDE指标生成报错可以不用管 ------------------------')   
      
     stats = {}

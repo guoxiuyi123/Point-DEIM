@@ -35,6 +35,7 @@ Resize = register()(T.Resize)
 SanitizeBoundingBoxes = register(name='SanitizeBoundingBoxes')(SanitizeBoundingBoxes)   
 RandomCrop = register()(T.RandomCrop)
 Normalize = register()(T.Normalize) 
+RandomErasing = register()(T.RandomErasing)
 
 logger = get_logger(__name__)
    

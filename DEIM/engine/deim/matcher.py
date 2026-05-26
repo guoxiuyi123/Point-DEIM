@@ -149,15 +149,23 @@ class HungarianMatcher(nn.Module):
     def get_top_k_matches(self, C, sizes, k=1, initial_indices=None):
         indices_list = []  
         # C_original = C.clone()
-        for i in range(k):     
-            indices_k = [linear_sum_assignment(c[i]) for i, c in enumerate(C.split(sizes, -1))] if i > 0 else initial_indices    
+        for k_i in range(k):     
+            indices_k = [linear_sum_assignment(c[i]) for i, c in enumerate(C.split(sizes, -1))] if k_i > 0 else initial_indices    
             indices_list.append([
                 (torch.as_tensor(i, dtype=torch.int64), torch.as_tensor(j, dtype=torch.int64))   
                 for i, j in indices_k
             ])
-            for c, idx_k in zip(C.split(sizes, -1), indices_k):    
-                idx_k = np.stack(idx_k)     
-                c[:, idx_k] = 1e6
+            for img_i, (c_chunk, idx_k) in enumerate(zip(C.split(sizes, -1), indices_k)):
+                row_ind, col_ind = idx_k
+                row = torch.as_tensor(row_ind, dtype=torch.long)
+                col = torch.as_tensor(col_ind, dtype=torch.long)
+                if row.numel() == 0:
+                    continue
+                qn = c_chunk.size(1)
+                tn = c_chunk.size(2)
+                valid = (row >= 0) & (row < qn) & (col >= 0) & (col < tn)
+                if valid.any():
+                    c_chunk[img_i, row[valid], col[valid]] = 1e6
         indices_list = [(torch.cat([indices_list[i][j][0] for i in range(k)], dim=0),   
                         torch.cat([indices_list[i][j][1] for i in range(k)], dim=0)) for j in range(len(sizes))]  
         # C.copy_(C_original)   
