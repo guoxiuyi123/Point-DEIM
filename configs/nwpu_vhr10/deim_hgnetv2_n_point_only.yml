@@ -25,10 +25,14 @@ PointSupDEIMCriterionScaleAdaptiveInitScoreThreshSchedule:
   reg_max: 32
   dino_semantic_enable: True
   dino_semantic_ckpt: weight/dinov2/dinov2_vits14_reg4_pretrain.pth
-  dino_semantic_weight: 0.2
+  dino_semantic_mode: point_sim
+  dino_semantic_weight: 2.0
   dino_semantic_input_size: 560
   dino_semantic_max_boxes: 64
   dino_semantic_tau: 0.02
+  dino_semantic_sim_thresh: 0.65
+  dino_semantic_min_mask: 4
+  dino_semantic_min_wh: 0.01
   dino_semantic_interval: 1
   matcher:
     type: HungarianMatcher
@@ -83,7 +87,7 @@ PointSupDEIMCriterionScaleAdaptiveInitScoreThreshSchedule:
     score_weight_power: 1.0
     score_topk: 7
     score_topk_begin_epoch: 0
-    score_topk_end_epoch: 80
+    score_topk_end_epoch: 140
     refine_points: True
     refine_lamda: 0.5
     refine_points_by: attn_center

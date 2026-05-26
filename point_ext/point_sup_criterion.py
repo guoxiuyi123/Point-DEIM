@@ -46,10 +46,14 @@ class PointSupDEIMCriterionV2(DEIMCriterion):
         density_area_reduce: str = "median",
         dino_semantic_enable: bool = False,
         dino_semantic_ckpt: str | None = None,
+        dino_semantic_mode: str = "variance",
         dino_semantic_weight: float = 0.0,
         dino_semantic_input_size: int = 560,
         dino_semantic_max_boxes: int = 64,
         dino_semantic_tau: float = 0.02,
+        dino_semantic_sim_thresh: float = 0.65,
+        dino_semantic_min_mask: int = 4,
+        dino_semantic_min_wh: float | None = None,
         dino_semantic_interval: int = 1,
         update_topk: int = 0,
         update_use_aux_outputs: bool = False,
@@ -108,10 +112,14 @@ class PointSupDEIMCriterionV2(DEIMCriterion):
 
         self.dino_semantic_enable = bool(dino_semantic_enable)
         self.dino_semantic_ckpt = None if dino_semantic_ckpt is None else str(dino_semantic_ckpt)
+        self.dino_semantic_mode = str(dino_semantic_mode)
         self.dino_semantic_weight = float(dino_semantic_weight)
         self.dino_semantic_input_size = int(dino_semantic_input_size)
         self.dino_semantic_max_boxes = int(dino_semantic_max_boxes)
         self.dino_semantic_tau = float(dino_semantic_tau)
+        self.dino_semantic_sim_thresh = float(dino_semantic_sim_thresh)
+        self.dino_semantic_min_mask = int(dino_semantic_min_mask)
+        self.dino_semantic_min_wh = None if dino_semantic_min_wh is None else float(dino_semantic_min_wh)
         self.dino_semantic_interval = int(dino_semantic_interval)
         self._dino = None
         self._dino_device = None
@@ -363,45 +371,93 @@ class PointSupDEIMCriterionV2(DEIMCriterion):
                 k = int(getattr(self, "dino_semantic_max_boxes", 64))
                 k = max(1, min(k, int(scores.numel())))
                 sel = scores.detach().topk(k=k, largest=True).indices
-                boxes_sel = pred_boxes[sel].detach()
-                cx = boxes_sel[:, 0]
-                cy = boxes_sel[:, 1]
-                bw = boxes_sel[:, 2].clamp(min=1e-6)
-                bh = boxes_sel[:, 3].clamp(min=1e-6)
-                x1 = (cx - 0.5 * bw).clamp(0.0, 1.0)
-                y1 = (cy - 0.5 * bh).clamp(0.0, 1.0)
-                x2 = (cx + 0.5 * bw).clamp(0.0, 1.0)
-                y2 = (cy + 0.5 * bh).clamp(0.0, 1.0)
                 hp, wp = dino_hw
-                fx1 = torch.floor(x1 * float(wp)).to(dtype=torch.long)
-                fy1 = torch.floor(y1 * float(hp)).to(dtype=torch.long)
-                fx2 = torch.ceil(x2 * float(wp)).to(dtype=torch.long)
-                fy2 = torch.ceil(y2 * float(hp)).to(dtype=torch.long)
-                fx1 = fx1.clamp(min=0, max=wp - 1)
-                fy1 = fy1.clamp(min=0, max=hp - 1)
-                fx2 = fx2.clamp(min=1, max=wp)
-                fy2 = fy2.clamp(min=1, max=hp)
-                tau = float(getattr(self, "dino_semantic_tau", 0.02))
-                tau = max(tau, 1e-6)
-                sem = torch.ones((k,), device=device, dtype=scores.dtype)
-                for j in range(k):
-                    a = int(fy1[j].item())
-                    b2 = int(fy2[j].item())
-                    c = int(fx1[j].item())
-                    d2 = int(fx2[j].item())
-                    if b2 <= a or d2 <= c:
-                        continue
-                    tok = dino_feat[b, a:b2, c:d2, :].reshape(-1, dino_feat.shape[-1])
-                    if int(tok.shape[0]) <= 1:
-                        continue
-                    v = tok.var(dim=0, unbiased=False).mean()
-                    sem[j] = torch.exp((-v).to(dtype=scores.dtype) / float(tau))
-                scores = scores * sem.new_ones(scores.shape[0])
-                scores[sel] = scores[sel] * sem
-                if float(getattr(self, "dino_semantic_weight", 0.0)) > 0.0:
-                    l = ((1.0 - sem).detach() * scores[sel]).mean() * float(getattr(self, "dino_semantic_weight", 0.0))
-                    dino_loss_sum = l if dino_loss_sum is None else (dino_loss_sum + l)
-                    dino_loss_n += 1.0
+                mode = str(getattr(self, "dino_semantic_mode", "variance"))
+                if mode == "point_sim":
+                    boxes_sel = pred_boxes[sel]
+                    pts_sel = pseudo_targets[b]["points"][tgt_idx][sel]
+                    px = torch.clamp((pts_sel[:, 0] * float(wp)).to(dtype=torch.long), min=0, max=wp - 1)
+                    py = torch.clamp((pts_sel[:, 1] * float(hp)).to(dtype=torch.long), min=0, max=hp - 1)
+                    flat = dino_feat[b].reshape(hp * wp, -1)
+                    flat_n = F.normalize(flat, dim=1)
+                    idx = (py * wp + px).to(dtype=torch.long)
+                    f_p = flat_n[idx]
+                    sim = f_p @ flat_n.t()
+                    thr = float(getattr(self, "dino_semantic_sim_thresh", 0.65))
+                    mask = sim > thr
+                    min_mask = int(getattr(self, "dino_semantic_min_mask", 4))
+                    cnt = mask.sum(dim=1)
+                    valid = cnt >= int(max(1, min_mask))
+                    if bool(valid.any()):
+                        x_flat = (torch.arange(hp * wp, device=device) % wp).view(1, -1).expand(k, -1)
+                        y_flat = (torch.arange(hp * wp, device=device) // wp).view(1, -1).expand(k, -1)
+                        big = int(10**9)
+                        x1i = x_flat.masked_fill(~mask, big).min(dim=1).values
+                        x2i = x_flat.masked_fill(~mask, -big).max(dim=1).values
+                        y1i = y_flat.masked_fill(~mask, big).min(dim=1).values
+                        y2i = y_flat.masked_fill(~mask, -big).max(dim=1).values
+                        x1 = (x1i.to(dtype=boxes_sel.dtype) / float(wp)).clamp(0.0, 1.0)
+                        y1 = (y1i.to(dtype=boxes_sel.dtype) / float(hp)).clamp(0.0, 1.0)
+                        x2 = ((x2i.to(dtype=boxes_sel.dtype) + 1.0) / float(wp)).clamp(0.0, 1.0)
+                        y2 = ((y2i.to(dtype=boxes_sel.dtype) + 1.0) / float(hp)).clamp(0.0, 1.0)
+                        cx = ((x1 + x2) * 0.5).clamp(0.0, 1.0)
+                        cy = ((y1 + y2) * 0.5).clamp(0.0, 1.0)
+                        w = (x2 - x1).clamp(min=1e-6)
+                        h = (y2 - y1).clamp(min=1e-6)
+                        min_wh = self.dino_semantic_min_wh
+                        if min_wh is None:
+                            min_wh = float(self.pseudo_box_cfg.min_wh)
+                        w = w.clamp(min=float(min_wh), max=float(self.pseudo_box_cfg.max_wh))
+                        h = h.clamp(min=float(min_wh), max=float(self.pseudo_box_cfg.max_wh))
+                        dino_boxes = torch.stack([cx, cy, w, h], dim=1)
+                        if float(getattr(self, "dino_semantic_weight", 0.0)) > 0.0:
+                            l = F.l1_loss(boxes_sel[valid], dino_boxes[valid], reduction="mean") * float(
+                                getattr(self, "dino_semantic_weight", 0.0)
+                            )
+                            dino_loss_sum = l if dino_loss_sum is None else (dino_loss_sum + l)
+                            dino_loss_n += 1.0
+                else:
+                    boxes_sel = pred_boxes[sel].detach()
+                    cx = boxes_sel[:, 0]
+                    cy = boxes_sel[:, 1]
+                    bw = boxes_sel[:, 2].clamp(min=1e-6)
+                    bh = boxes_sel[:, 3].clamp(min=1e-6)
+                    x1 = (cx - 0.5 * bw).clamp(0.0, 1.0)
+                    y1 = (cy - 0.5 * bh).clamp(0.0, 1.0)
+                    x2 = (cx + 0.5 * bw).clamp(0.0, 1.0)
+                    y2 = (cy + 0.5 * bh).clamp(0.0, 1.0)
+                    fx1 = torch.floor(x1 * float(wp)).to(dtype=torch.long)
+                    fy1 = torch.floor(y1 * float(hp)).to(dtype=torch.long)
+                    fx2 = torch.ceil(x2 * float(wp)).to(dtype=torch.long)
+                    fy2 = torch.ceil(y2 * float(hp)).to(dtype=torch.long)
+                    fx1 = fx1.clamp(min=0, max=wp - 1)
+                    fy1 = fy1.clamp(min=0, max=hp - 1)
+                    fx2 = fx2.clamp(min=1, max=wp)
+                    fy2 = fy2.clamp(min=1, max=hp)
+                    tau = float(getattr(self, "dino_semantic_tau", 0.02))
+                    tau = max(tau, 1e-6)
+                    sem = torch.ones((k,), device=device, dtype=scores.dtype)
+                    for j in range(k):
+                        a = int(fy1[j].item())
+                        b2 = int(fy2[j].item())
+                        c = int(fx1[j].item())
+                        d2 = int(fx2[j].item())
+                        if b2 <= a or d2 <= c:
+                            continue
+                        tok = dino_feat[b, a:b2, c:d2, :].reshape(-1, dino_feat.shape[-1])
+                        if int(tok.shape[0]) <= 1:
+                            continue
+                        v = tok.var(dim=0, unbiased=False).mean()
+                        sem[j] = torch.exp((-v).to(dtype=scores.dtype) / float(tau))
+                    scores = scores * sem.new_ones(scores.shape[0])
+                    scores[sel] = scores[sel] * sem
+                    if float(getattr(self, "dino_semantic_weight", 0.0)) > 0.0:
+                        sem_clamped = sem.clamp(min=1e-6)
+                        l = (-torch.log(sem_clamped).detach() * scores[sel]).mean() * float(
+                            getattr(self, "dino_semantic_weight", 0.0)
+                        )
+                        dino_loss_sum = l if dino_loss_sum is None else (dino_loss_sum + l)
+                        dino_loss_n += 1.0
 
             upd = self.pseudo_box_memory.update(
                 sample_idx=sample_idx,
