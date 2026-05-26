@@ -54,6 +54,7 @@ class PointSupDEIMCriterionV2(DEIMCriterion):
         dino_semantic_sim_thresh: float = 0.65,
         dino_semantic_min_mask: int = 4,
         dino_semantic_min_wh: float | None = None,
+        dino_semantic_prop_iters: int = 12,
         dino_semantic_interval: int = 1,
         update_topk: int = 0,
         update_use_aux_outputs: bool = False,
@@ -120,6 +121,7 @@ class PointSupDEIMCriterionV2(DEIMCriterion):
         self.dino_semantic_sim_thresh = float(dino_semantic_sim_thresh)
         self.dino_semantic_min_mask = int(dino_semantic_min_mask)
         self.dino_semantic_min_wh = None if dino_semantic_min_wh is None else float(dino_semantic_min_wh)
+        self.dino_semantic_prop_iters = int(dino_semantic_prop_iters)
         self.dino_semantic_interval = int(dino_semantic_interval)
         self._dino = None
         self._dino_device = None
@@ -384,7 +386,16 @@ class PointSupDEIMCriterionV2(DEIMCriterion):
                     f_p = flat_n[idx]
                     sim = f_p @ flat_n.t()
                     thr = float(getattr(self, "dino_semantic_sim_thresh", 0.65))
-                    mask = sim > thr
+                    sim_mask_2d = (sim > thr).view(k, 1, hp, wp).to(dtype=boxes_sel.dtype)
+                    seed_mask = torch.zeros((k, 1, hp, wp), device=device, dtype=boxes_sel.dtype)
+                    seed_mask[torch.arange(k, device=device), 0, py, px] = 1.0
+                    iters = int(getattr(self, "dino_semantic_prop_iters", 12))
+                    if iters <= 0:
+                        iters = 1
+                    for _ in range(iters):
+                        dilated = F.max_pool2d(seed_mask, kernel_size=3, stride=1, padding=1)
+                        seed_mask = dilated * sim_mask_2d
+                    mask = seed_mask.view(k, hp * wp) > 0.5
                     min_mask = int(getattr(self, "dino_semantic_min_mask", 4))
                     cnt = mask.sum(dim=1)
                     valid = cnt >= int(max(1, min_mask))

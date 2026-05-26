@@ -33,6 +33,7 @@ PointSupDEIMCriterionScaleAdaptiveInitScoreThreshSchedule:
   dino_semantic_sim_thresh: 0.65
   dino_semantic_min_mask: 4
   dino_semantic_min_wh: 0.01
+  dino_semantic_prop_iters: 12
   dino_semantic_interval: 1
   matcher:
     type: HungarianMatcher
