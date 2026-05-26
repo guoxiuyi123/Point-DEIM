@@ -10,6 +10,8 @@ from engine.deim.deim_criterion import DEIMCriterion
 from engine.deim.box_ops import box_cxcywh_to_xyxy, generalized_box_iou
 from engine.deim.pseudo_box_memory import PseudoBoxConfig, PseudoBoxMemory
 
+from .dinov2_vit import load_dinov2_vits14_reg4
+
 
 @register()
 class PointSupDEIMCriterionV2(DEIMCriterion):
@@ -34,6 +36,21 @@ class PointSupDEIMCriterionV2(DEIMCriterion):
         density_recall_penalty=1.1,
         density_precision_penalty=1.3,
         mask_point_sample_ratio=8,
+        density_area_aware: bool = False,
+        density_area_low: float = 0.0025,
+        density_area_high: float = 0.09,
+        density_recall_penalty_mult_small: float = 1.0,
+        density_recall_penalty_mult_large: float = 1.0,
+        density_precision_penalty_mult_small: float = 1.0,
+        density_precision_penalty_mult_large: float = 1.0,
+        density_area_reduce: str = "median",
+        dino_semantic_enable: bool = False,
+        dino_semantic_ckpt: str | None = None,
+        dino_semantic_weight: float = 0.0,
+        dino_semantic_input_size: int = 560,
+        dino_semantic_max_boxes: int = 64,
+        dino_semantic_tau: float = 0.02,
+        dino_semantic_interval: int = 1,
         update_topk: int = 0,
         update_use_aux_outputs: bool = False,
         update_use_enc_aux_outputs: bool = False,
@@ -75,6 +92,33 @@ class PointSupDEIMCriterionV2(DEIMCriterion):
         self.update_burnin_epochs = int(update_burnin_epochs)
         self.reg_quality_weight = str(reg_quality_weight)
         self.reg_quality_power = float(reg_quality_power)
+        self.density_area_aware = bool(density_area_aware)
+        self.density_area_low = float(density_area_low)
+        self.density_area_high = float(density_area_high)
+        self.density_recall_penalty_mult_small = float(density_recall_penalty_mult_small)
+        self.density_recall_penalty_mult_large = float(density_recall_penalty_mult_large)
+        self.density_precision_penalty_mult_small = float(density_precision_penalty_mult_small)
+        self.density_precision_penalty_mult_large = float(density_precision_penalty_mult_large)
+        self.density_area_reduce = str(density_area_reduce)
+        if isinstance(pseudo_box, dict):
+            if "density_recall_penalty" in pseudo_box:
+                self.density_recall_penalty = float(pseudo_box["density_recall_penalty"])
+            if "density_precision_penalty" in pseudo_box:
+                self.density_precision_penalty = float(pseudo_box["density_precision_penalty"])
+
+        self.dino_semantic_enable = bool(dino_semantic_enable)
+        self.dino_semantic_ckpt = None if dino_semantic_ckpt is None else str(dino_semantic_ckpt)
+        self.dino_semantic_weight = float(dino_semantic_weight)
+        self.dino_semantic_input_size = int(dino_semantic_input_size)
+        self.dino_semantic_max_boxes = int(dino_semantic_max_boxes)
+        self.dino_semantic_tau = float(dino_semantic_tau)
+        self.dino_semantic_interval = int(dino_semantic_interval)
+        self._dino = None
+        self._dino_device = None
+        if self.dino_semantic_enable:
+            if not self.dino_semantic_ckpt:
+                raise ValueError("dino_semantic_enable=True requires dino_semantic_ckpt")
+            self._dino = load_dinov2_vits14_reg4(self.dino_semantic_ckpt, device=None)
 
     def loss_boxes(self, outputs, targets, indices, num_boxes, boxes_weight=None):
         if self.reg_quality_weight != "cls_score":
@@ -125,6 +169,54 @@ class PointSupDEIMCriterionV2(DEIMCriterion):
         device = next(iter(outputs.values())).device
         dtype = outputs["pred_boxes"].dtype if "pred_boxes" in outputs else torch.float32
 
+        images_input = kwargs.get("images", None)
+        images_tensor = None
+        if images_input is not None:
+            if hasattr(images_input, "tensors"):
+                images_tensor = images_input.tensors
+            elif torch.is_tensor(images_input):
+                images_tensor = images_input
+
+        dino_feat = None
+        dino_hw = None
+        dino_valid = (
+            bool(getattr(self, "dino_semantic_enable", False))
+            and (self._dino is not None)
+            and (images_tensor is not None)
+            and float(getattr(self, "dino_semantic_weight", 0.0)) > 0.0
+        )
+        if dino_valid:
+            step = kwargs.get("step", 0)
+            interval = int(getattr(self, "dino_semantic_interval", 1))
+            if interval <= 0:
+                interval = 1
+            dino_valid = (int(step) % interval) == 0
+
+        if dino_valid:
+            if images_tensor.dtype not in (torch.float16, torch.float32, torch.bfloat16):
+                images_tensor = images_tensor.float()
+            if float(images_tensor.max().item()) > 1.5:
+                images_tensor = images_tensor / 255.0
+            mean = torch.tensor([0.485, 0.456, 0.406], device=images_tensor.device, dtype=images_tensor.dtype)[None, :, None, None]
+            std = torch.tensor([0.229, 0.224, 0.225], device=images_tensor.device, dtype=images_tensor.dtype)[None, :, None, None]
+            patch = 14
+            s = int(getattr(self, "dino_semantic_input_size", 560))
+            s = int(max(patch, (s // patch) * patch))
+            imgs = torch.nn.functional.interpolate(images_tensor, size=(s, s), mode="bilinear", align_corners=False)
+            imgs = (imgs - mean) / std
+
+            if self._dino_device != imgs.device:
+                self._dino.to(device=imgs.device)
+                self._dino_device = imgs.device
+
+            with torch.no_grad():
+                out = self._dino.forward_features(imgs)
+                feat = out["x_norm_patchtokens"]
+                hw = out["hw"]
+                hp, wp = int(hw[0].item()), int(hw[1].item())
+                dino_feat = feat.reshape(int(feat.shape[0]), hp, wp, int(feat.shape[-1]))
+                dino_hw = (hp, wp)
+
         pseudo_targets = []
         for t in targets:
             points = t.get("points", None)
@@ -147,7 +239,31 @@ class PointSupDEIMCriterionV2(DEIMCriterion):
             pt["points"] = refined_points
             pseudo_targets.append(pt)
 
+        old_drp = float(getattr(self, "density_recall_penalty", 1.1))
+        old_dpp = float(getattr(self, "density_precision_penalty", 1.3))
+        if bool(getattr(self, "density_area_aware", False)) and len(pseudo_targets) > 0:
+            boxes_all = [pt["boxes"] for pt in pseudo_targets if "boxes" in pt and pt["boxes"].numel() > 0]
+            if len(boxes_all) > 0:
+                boxes_cat = torch.cat(boxes_all, dim=0)
+                area = (boxes_cat[:, 2] * boxes_cat[:, 3]).clamp(min=1e-6)
+                if str(getattr(self, "density_area_reduce", "median")) == "mean":
+                    a = float(area.mean().item())
+                else:
+                    a = float(area.median().item())
+                lo = max(float(getattr(self, "density_area_low", 0.0025)), 1e-6)
+                hi = max(float(getattr(self, "density_area_high", 0.09)), lo + 1e-6)
+                t_area = float((torch.tensor(a).log() - torch.tensor(lo).log()) / (torch.tensor(hi).log() - torch.tensor(lo).log()))
+                t_area = float(max(0.0, min(1.0, t_area)))
+                rr0 = float(getattr(self, "density_recall_penalty_mult_small", 1.0))
+                rr1 = float(getattr(self, "density_recall_penalty_mult_large", 1.0))
+                rp0 = float(getattr(self, "density_precision_penalty_mult_small", 1.0))
+                rp1 = float(getattr(self, "density_precision_penalty_mult_large", 1.0))
+                self.density_recall_penalty = old_drp * float(rr0 + (rr1 - rr0) * t_area)
+                self.density_precision_penalty = old_dpp * float(rp0 + (rp1 - rp0) * t_area)
+
         losses = super().forward(outputs, pseudo_targets, **kwargs)
+        self.density_recall_penalty = old_drp
+        self.density_precision_penalty = old_dpp
 
         epoch = int(kwargs.get("epoch", 0))
         outputs_without_aux = {k: v for k, v in outputs.items() if "aux" not in k}
@@ -195,6 +311,8 @@ class PointSupDEIMCriterionV2(DEIMCriterion):
         upd_tgt_total = 0.0
         upd_tgt_updated = 0.0
         n_pts = int(sum(int(t["points"].shape[0]) for t in targets))
+        dino_loss_sum = None
+        dino_loss_n = 0.0
         for b in range(len(pseudo_targets)):
             idx_tensor = targets[b]["idx"]
             sample_idx = int(idx_tensor.item()) if hasattr(idx_tensor, "item") else int(idx_tensor)
@@ -203,6 +321,7 @@ class PointSupDEIMCriterionV2(DEIMCriterion):
             tgt_all = []
             logits_all = []
             boxes_all = []
+            centers_all = []
 
             for layer, idx_list in zip(layers, all_indices):
                 src_idx, tgt_idx = idx_list[b]
@@ -212,6 +331,8 @@ class PointSupDEIMCriterionV2(DEIMCriterion):
                 tgt_all.append(tgt_idx)
                 logits_all.append(layer["pred_logits"][b][src_idx])
                 boxes_all.append(layer["pred_boxes"][b][src_idx])
+                if "pred_attn_centers" in layer:
+                    centers_all.append(layer["pred_attn_centers"][b][src_idx])
 
             if len(tgt_all) == 0:
                 continue
@@ -220,6 +341,7 @@ class PointSupDEIMCriterionV2(DEIMCriterion):
             tgt_idx = torch.cat(tgt_all, dim=0)
             logits = torch.cat(logits_all, dim=0)
             pred_boxes = torch.cat(boxes_all, dim=0)
+            pred_centers = torch.cat(centers_all, dim=0) if len(centers_all) > 0 else None
 
             matched += int(tgt_idx.numel())
             labels = pseudo_targets[b]["labels"][tgt_idx]
@@ -237,6 +359,50 @@ class PointSupDEIMCriterionV2(DEIMCriterion):
                 else:
                     scores = prob.gather(1, labels[:, None]).squeeze(1)
 
+            if dino_feat is not None and dino_hw is not None and int(scores.numel()) > 0:
+                k = int(getattr(self, "dino_semantic_max_boxes", 64))
+                k = max(1, min(k, int(scores.numel())))
+                sel = scores.detach().topk(k=k, largest=True).indices
+                boxes_sel = pred_boxes[sel].detach()
+                cx = boxes_sel[:, 0]
+                cy = boxes_sel[:, 1]
+                bw = boxes_sel[:, 2].clamp(min=1e-6)
+                bh = boxes_sel[:, 3].clamp(min=1e-6)
+                x1 = (cx - 0.5 * bw).clamp(0.0, 1.0)
+                y1 = (cy - 0.5 * bh).clamp(0.0, 1.0)
+                x2 = (cx + 0.5 * bw).clamp(0.0, 1.0)
+                y2 = (cy + 0.5 * bh).clamp(0.0, 1.0)
+                hp, wp = dino_hw
+                fx1 = torch.floor(x1 * float(wp)).to(dtype=torch.long)
+                fy1 = torch.floor(y1 * float(hp)).to(dtype=torch.long)
+                fx2 = torch.ceil(x2 * float(wp)).to(dtype=torch.long)
+                fy2 = torch.ceil(y2 * float(hp)).to(dtype=torch.long)
+                fx1 = fx1.clamp(min=0, max=wp - 1)
+                fy1 = fy1.clamp(min=0, max=hp - 1)
+                fx2 = fx2.clamp(min=1, max=wp)
+                fy2 = fy2.clamp(min=1, max=hp)
+                tau = float(getattr(self, "dino_semantic_tau", 0.02))
+                tau = max(tau, 1e-6)
+                sem = torch.ones((k,), device=device, dtype=scores.dtype)
+                for j in range(k):
+                    a = int(fy1[j].item())
+                    b2 = int(fy2[j].item())
+                    c = int(fx1[j].item())
+                    d2 = int(fx2[j].item())
+                    if b2 <= a or d2 <= c:
+                        continue
+                    tok = dino_feat[b, a:b2, c:d2, :].reshape(-1, dino_feat.shape[-1])
+                    if int(tok.shape[0]) <= 1:
+                        continue
+                    v = tok.var(dim=0, unbiased=False).mean()
+                    sem[j] = torch.exp((-v).to(dtype=scores.dtype) / float(tau))
+                scores = scores * sem.new_ones(scores.shape[0])
+                scores[sel] = scores[sel] * sem
+                if float(getattr(self, "dino_semantic_weight", 0.0)) > 0.0:
+                    l = ((1.0 - sem).detach() * scores[sel]).mean() * float(getattr(self, "dino_semantic_weight", 0.0))
+                    dino_loss_sum = l if dino_loss_sum is None else (dino_loss_sum + l)
+                    dino_loss_n += 1.0
+
             upd = self.pseudo_box_memory.update(
                 sample_idx=sample_idx,
                 tgt_indices=tgt_idx,
@@ -244,6 +410,7 @@ class PointSupDEIMCriterionV2(DEIMCriterion):
                 pred_scores=scores,
                 points=pseudo_targets[b]["points"],
                 epoch=epoch,
+                pred_centers=pred_centers,
             )
             upd_images += 1.0
             upd_total += float(upd["total"])
@@ -317,4 +484,6 @@ class PointSupDEIMCriterionV2(DEIMCriterion):
                 ),
             }
         )
+        if dino_loss_sum is not None and dino_loss_n > 0:
+            losses["loss_dino_semantic"] = dino_loss_sum / float(dino_loss_n)
         return losses

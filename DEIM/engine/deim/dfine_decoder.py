@@ -102,11 +102,14 @@ class MSDeformableAttention(nn.Module):
         init.constant_(self.attention_weights.bias, 0)     
      
 
-    def forward(self,   
-                query: torch.Tensor,   
-                reference_points: torch.Tensor,   
-                value: torch.Tensor,   
-                value_spatial_shapes: List[int]):
+    def forward(
+        self,
+        query: torch.Tensor,
+        reference_points: torch.Tensor,
+        value: torch.Tensor,
+        value_spatial_shapes: List[int],
+        return_attn: bool = False,
+    ):
         """
         Args:   
             query (Tensor): [bs, query_length, C]   
@@ -141,8 +144,12 @@ class MSDeformableAttention(nn.Module):
                 "Last dim of reference_points must be 2 or 4, but get {} instead.".  
                 format(reference_points.shape[-1]))
 
-        output = self.ms_deformable_attn_core(value, value_spatial_shapes, sampling_locations, attention_weights, self.num_points_list)
-     
+        output = self.ms_deformable_attn_core(
+            value, value_spatial_shapes, sampling_locations, attention_weights, self.num_points_list
+        )
+
+        if return_attn:
+            return output, sampling_locations, attention_weights
         return output
      
 
@@ -205,13 +212,15 @@ class TransformerDecoderLayer(nn.Module):
         # 线性变换 -> 激活函数 -> dropout -> 线性变换    
         return self.linear2(self.dropout3(self.activation(self.linear1(tgt))))
 
-    def forward(self,     
+    def forward(
+                self,
                 target,              # 目标查询（decoder的输入） 
                 reference_points,    # 参考点，用于交叉注意力
                 value,              # 编码器的输出，作为交叉注意力的值
                 spatial_shapes,     # 空间形状信息，用于多尺度处理  
                 attn_mask=None,     # 自注意力掩码，可选    
-                query_pos_embed=None): # 查询的位置嵌入，可选
+                query_pos_embed=None, # 查询的位置嵌入，可选
+                return_attn_center: bool = False):
      
         # 自注意力部分
         # q和k都加入位置嵌入（如果有），value直接使用target
@@ -225,11 +234,27 @@ class TransformerDecoderLayer(nn.Module):
 
         # 交叉注意力部分
         # 使用多尺度可变形注意力机制  
-        target2 = self.cross_attn(   
-            self.with_pos_embed(target, query_pos_embed), # 查询（带位置嵌入）   
-            reference_points,                             # 参考点
-            value,                                        # 编码器输出     
-            spatial_shapes)                               # 空间形状
+        if return_attn_center:
+            target2, sampling_locations, attention_weights = self.cross_attn(
+                self.with_pos_embed(target, query_pos_embed),
+                reference_points,
+                value,
+                spatial_shapes,
+                return_attn=True,
+            )
+            w = attention_weights
+            loc = sampling_locations
+            denom = w.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+            center = (w.unsqueeze(-1) * loc).sum(dim=-2) / denom
+            center = center.mean(dim=2).clamp(min=0.0, max=1.0)
+        else:
+            target2 = self.cross_attn(
+                self.with_pos_embed(target, query_pos_embed),
+                reference_points,
+                value,
+                spatial_shapes,
+            )
+            center = None
 
         # 通过门控机制融合交叉注意力结果   
         target = self.gateway(target, self.dropout2(target2))
@@ -241,6 +266,8 @@ class TransformerDecoderLayer(nn.Module):
         # 层归一化，并限制输出范围（防止数值溢出）  
         target = self.norm3(target.clamp(min=-65504, max=65504))     
      
+        if return_attn_center:
+            return target, center
         return target  # 返回处理后的目标查询    
     
 
@@ -404,7 +431,8 @@ class TransformerDecoder(nn.Module):
         self.layers = self.layers[:self.eval_idx + 1]    
         self.lqe_layers = nn.ModuleList([nn.Identity()] * (self.eval_idx) + [self.lqe_layers[self.eval_idx]])
  
-    def forward(self,  
+    def forward(
+                self,
                 target,             # 初始目标查询  
                 ref_points_unact,   # 未激活的参考点 
                 memory,            # 编码器输出
@@ -418,7 +446,8 @@ class TransformerDecoder(nn.Module):
                 reg_scale,         # 回归缩放因子     
                 attn_mask=None,    # 注意力掩码（可选）
                 memory_mask=None,  # 内存掩码（可选）  
-                dn_meta=None):     # 去噪元数据（可选）
+                dn_meta=None,     # 去噪元数据（可选）
+                return_attn_centers: bool = False):
         """    
         前向传播
         返回:     
@@ -433,6 +462,7 @@ class TransformerDecoder(nn.Module):
         dec_out_logits = []       # 存储每层的分类得分   
         dec_out_pred_corners = [] # 存储每层的角点预测
         dec_out_refs = []         # 存储每层的参考点
+        dec_out_attn_centers = []
         # 如果没有预定义 project，则动态生成权重函数   
         if not hasattr(self, 'project'):  
             project = weighting_function(self.reg_max, up, reg_scale)    
@@ -453,7 +483,13 @@ class TransformerDecoder(nn.Module):
                 output_detach = output.detach()
 
             # 通过解码器层更新 output 
-            output = layer(output, ref_points_input, value, spatial_shapes, attn_mask, query_pos_embed) 
+            if return_attn_centers:
+                output, attn_center = layer(
+                    output, ref_points_input, value, spatial_shapes, attn_mask, query_pos_embed, return_attn_center=True
+                )
+            else:
+                output = layer(output, ref_points_input, value, spatial_shapes, attn_mask, query_pos_embed)
+                attn_center = None
    
             if i == 0:
                 # 第一层：使用逆sigmoid精炼初始边界框预测  
@@ -473,6 +509,8 @@ class TransformerDecoder(nn.Module):
                 dec_out_bboxes.append(inter_ref_bbox)    
                 dec_out_pred_corners.append(pred_corners)
                 dec_out_refs.append(ref_points_initial)    
+                if return_attn_centers:
+                    dec_out_attn_centers.append(attn_center)
 
                 if not self.training:  # 推理模式下，仅计算到 eval_idx 层
                     break
@@ -482,8 +520,17 @@ class TransformerDecoder(nn.Module):
             output_detach = output.detach()
   
         # 将结果堆叠为张量返回
-        return torch.stack(dec_out_bboxes), torch.stack(dec_out_logits), \
-               torch.stack(dec_out_pred_corners), torch.stack(dec_out_refs), pre_bboxes, pre_scores     
+        out = (
+            torch.stack(dec_out_bboxes),
+            torch.stack(dec_out_logits),
+            torch.stack(dec_out_pred_corners),
+            torch.stack(dec_out_refs),
+            pre_bboxes,
+            pre_scores,
+        )
+        if return_attn_centers:
+            out = out + (torch.stack(dec_out_attn_centers),)
+        return out
   
   
 @register()   
@@ -518,6 +565,7 @@ class DFINETransformer(nn.Module):
                  reg_scale=4.,                # 回归缩放因子
                  layer_scale=1,               # 层缩放因子，用于调整隐藏层维度   
                  mlp_act='relu',              # MLP激活函数类型
+                 return_attn_centers: bool = False,
                  ):
         super().__init__()
         # 参数校验，确保输入特征通道数不超过多尺度层数
@@ -541,6 +589,7 @@ class DFINETransformer(nn.Module):
         self.eval_spatial_size = eval_spatial_size  
         self.aux_loss = aux_loss
         self.reg_max = reg_max
+        self.return_attn_centers = bool(return_attn_centers)
  
         # 校验查询选择和交叉注意力方法的有效性
         assert query_select_method in ('default', 'one2many', 'agnostic'), '查询选择方法无效' 
@@ -821,7 +870,7 @@ class DFINETransformer(nn.Module):
             self._get_decoder_input(memory, spatial_shapes, denoising_logits, denoising_bbox_unact)    
  
         # 解码器前向传播    
-        out_bboxes, out_logits, out_corners, out_refs, pre_bboxes, pre_logits = self.decoder(
+        decoder_out = self.decoder(
             init_ref_contents,
             init_ref_points_unact,
             memory,  
@@ -834,7 +883,11 @@ class DFINETransformer(nn.Module):
             self.up,   
             self.reg_scale,
             attn_mask=attn_mask, 
-            dn_meta=dn_meta)
+            dn_meta=dn_meta,
+            return_attn_centers=bool(self.return_attn_centers),
+        )
+        out_bboxes, out_logits, out_corners, out_refs, pre_bboxes, pre_logits = decoder_out[:6]
+        out_attn_centers = decoder_out[6] if (len(decoder_out) > 6) else None
  
         # 如果有去噪训练，分割去噪和正常输出   
         if self.training and dn_meta is not None: 
@@ -844,6 +897,8 @@ class DFINETransformer(nn.Module):
             dn_out_bboxes, out_bboxes = torch.split(out_bboxes, dn_meta['dn_num_split'], dim=2)  
             dn_out_corners, out_corners = torch.split(out_corners, dn_meta['dn_num_split'], dim=2)
             dn_out_refs, out_refs = torch.split(out_refs, dn_meta['dn_num_split'], dim=2)
+            if out_attn_centers is not None:
+                _, out_attn_centers = torch.split(out_attn_centers, dn_meta['dn_num_split'], dim=2)
   
         # 构造输出字典
         if self.training: 
@@ -851,11 +906,21 @@ class DFINETransformer(nn.Module):
                    'ref_points': out_refs[-1], 'up': self.up, 'reg_scale': self.reg_scale}   
         else:    
             out = {'pred_logits': out_logits[-1], 'pred_boxes': out_bboxes[-1]}
+        if out_attn_centers is not None:
+            out["pred_attn_centers"] = out_attn_centers[-1]
 
         # 如果是训练阶段且使用辅助损失，添加辅助输出
         if self.training and self.aux_loss: 
-            out['aux_outputs'] = self._set_aux_loss2(out_logits[:-1], out_bboxes[:-1], out_corners[:-1], out_refs[:-1], 
-                                                     out_corners[-1], out_logits[-1])
+            aux_attn = out_attn_centers[:-1] if out_attn_centers is not None else None
+            out['aux_outputs'] = self._set_aux_loss2(
+                out_logits[:-1],
+                out_bboxes[:-1],
+                out_corners[:-1],
+                out_refs[:-1],
+                out_corners[-1],
+                out_logits[-1],
+                aux_attn_centers=aux_attn,
+            )
             out['enc_aux_outputs'] = self._set_aux_loss(enc_topk_logits_list, enc_topk_bboxes_list)
             out['pre_outputs'] = {'pred_logits': pre_logits, 'pred_boxes': pre_bboxes} 
             out['enc_meta'] = {'class_agnostic': self.query_select_method == 'agnostic'}
@@ -881,10 +946,31 @@ class DFINETransformer(nn.Module):
 
     @torch.jit.unused
     def _set_aux_loss2(self, outputs_class, outputs_coord, outputs_corners, outputs_ref,   
-                       teacher_corners=None, teacher_logits=None):
+                       teacher_corners=None, teacher_logits=None, aux_attn_centers=None):
         # this is a workaround to make torchscript happy, as torchscript
         # doesn't support dictionary with non-homogeneous values, such
         # as a dict having both a Tensor and a list.
-        return [{'pred_logits': a, 'pred_boxes': b, 'pred_corners': c, 'ref_points': d,
-                     'teacher_corners': teacher_corners, 'teacher_logits': teacher_logits}    
-                for a, b, c, d in zip(outputs_class, outputs_coord, outputs_corners, outputs_ref)]
+        if aux_attn_centers is None:
+            return [
+                {
+                    'pred_logits': a,
+                    'pred_boxes': b,
+                    'pred_corners': c,
+                    'ref_points': d,
+                    'teacher_corners': teacher_corners,
+                    'teacher_logits': teacher_logits,
+                }
+                for a, b, c, d in zip(outputs_class, outputs_coord, outputs_corners, outputs_ref)
+            ]
+        return [
+            {
+                'pred_logits': a,
+                'pred_boxes': b,
+                'pred_corners': c,
+                'ref_points': d,
+                'teacher_corners': teacher_corners,
+                'teacher_logits': teacher_logits,
+                'pred_attn_centers': e,
+            }
+            for a, b, c, d, e in zip(outputs_class, outputs_coord, outputs_corners, outputs_ref, aux_attn_centers)
+        ]

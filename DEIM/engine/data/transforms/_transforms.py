@@ -235,6 +235,108 @@ class RandomIoUCrop(T.RandomIoUCrop):
      
   
 @register()
+class PointAwareCopyPaste(T.Transform):
+    def __init__(
+        self,
+        p: float = 0.5,
+        max_paste: int = 3,
+        max_area_ratio: float = 0.01,
+        bbox_pad: int = 0,
+        max_iou: float = 0.1,
+        max_trials: int = 50,
+    ) -> None:
+        super().__init__()
+        self.p = float(p)
+        self.max_paste = int(max_paste)
+        self.max_area_ratio = float(max_area_ratio)
+        self.bbox_pad = int(bbox_pad)
+        self.max_iou = float(max_iou)
+        self.max_trials = int(max_trials)
+
+    def forward(self, *inputs: Any) -> Any:
+        sample = inputs if len(inputs) > 1 else inputs[0]
+        if not isinstance(sample, (tuple, list)) or len(sample) < 2:
+            return sample
+
+        image = sample[0]
+        target = sample[1]
+        if not isinstance(target, dict) or "boxes" not in target or "labels" not in target:
+            return sample
+        if not isinstance(image, PIL.Image.Image):
+            return sample
+        if self.p <= 0 or torch.rand(1).item() >= self.p:
+            return sample
+
+        boxes = target["boxes"]
+        labels = target["labels"]
+        if boxes.numel() == 0:
+            return sample
+
+        w, h = image.size
+        img_area = float(max(1, w * h))
+        b = boxes.to(dtype=torch.float32)
+        wh = (b[:, 2:] - b[:, :2]).clamp(min=0.0)
+        area = (wh[:, 0] * wh[:, 1]).cpu()
+        small = area <= (float(self.max_area_ratio) * img_area)
+        if not bool(small.any()):
+            return sample
+
+        cand = torch.nonzero(small, as_tuple=False).squeeze(1).tolist()
+        if len(cand) == 0:
+            return sample
+
+        n_paste = min(int(self.max_paste), len(cand))
+        perm = torch.randperm(len(cand))[:n_paste].tolist()
+        pick = [cand[i] for i in perm]
+
+        out_image = image.copy()
+        out_boxes = b.clone()
+        out_labels = labels.clone()
+
+        for idx in pick:
+            x1, y1, x2, y2 = out_boxes[idx].tolist()
+            x1 = int(max(0, min(w - 1, round(x1) - self.bbox_pad)))
+            y1 = int(max(0, min(h - 1, round(y1) - self.bbox_pad)))
+            x2 = int(max(0, min(w, round(x2) + self.bbox_pad)))
+            y2 = int(max(0, min(h, round(y2) + self.bbox_pad)))
+            pw = int(max(1, x2 - x1))
+            ph = int(max(1, y2 - y1))
+            if pw <= 1 or ph <= 1:
+                continue
+            patch = out_image.crop((x1, y1, x2, y2))
+
+            placed = False
+            for _ in range(int(self.max_trials)):
+                nx1 = int(torch.randint(low=0, high=max(1, w - pw + 1), size=(1,)).item())
+                ny1 = int(torch.randint(low=0, high=max(1, h - ph + 1), size=(1,)).item())
+                nx2 = nx1 + pw
+                ny2 = ny1 + ph
+                new_box = torch.tensor([[nx1, ny1, nx2, ny2]], dtype=torch.float32)
+                iou = torchvision.ops.box_iou(new_box, out_boxes).max().item()
+                if float(iou) > float(self.max_iou):
+                    continue
+                out_image.paste(patch, (nx1, ny1))
+                out_boxes = torch.cat([out_boxes, new_box], dim=0)
+                out_labels = torch.cat([out_labels, out_labels[idx : idx + 1]], dim=0)
+                placed = True
+                break
+            if not placed:
+                continue
+
+        if int(out_boxes.shape[0]) == int(boxes.shape[0]):
+            return sample
+
+        spatial_size = getattr(boxes, _boxes_keys[1])
+        target = dict(target)
+        target["boxes"] = convert_to_tv_tensor(out_boxes, key="boxes", box_format=boxes.format.value, spatial_size=spatial_size)
+        target["labels"] = out_labels
+
+        if isinstance(sample, tuple):
+            return (out_image, target, *sample[2:])
+        return [out_image, target, *sample[2:]]
+
+
+@register()
 class ConvertBoxes(T.Transform):   
     _transformed_types = (
         BoundingBoxes, 

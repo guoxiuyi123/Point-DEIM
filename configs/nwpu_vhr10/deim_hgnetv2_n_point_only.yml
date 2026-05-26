@@ -12,6 +12,9 @@ flat_epoch: 80
 no_aug_epoch: 20
 lr_gamma: 0.1
 
+DFINETransformer:
+  return_attn_centers: True
+
 criterion: PointSupDEIMCriterionScaleAdaptiveInitScoreThreshSchedule
 
 PointSupDEIMCriterionScaleAdaptiveInitScoreThreshSchedule:
@@ -20,11 +23,26 @@ PointSupDEIMCriterionScaleAdaptiveInitScoreThreshSchedule:
   alpha: 0.75
   gamma: 2.0
   reg_max: 32
+  dino_semantic_enable: True
+  dino_semantic_ckpt: weight/dinov2/dinov2_vits14_reg4_pretrain.pth
+  dino_semantic_weight: 0.2
+  dino_semantic_input_size: 560
+  dino_semantic_max_boxes: 64
+  dino_semantic_tau: 0.02
+  dino_semantic_interval: 1
   matcher:
     type: HungarianMatcher
     weight_dict: {cost_class: 2, cost_bbox: 5, cost_giou: 2}
     alpha: 0.25
     gamma: 2.0
+  density_area_aware: True
+  density_area_low: 0.0025
+  density_area_high: 0.09
+  density_area_reduce: median
+  density_recall_penalty_mult_small: 1.5
+  density_recall_penalty_mult_large: 0.8
+  density_precision_penalty_mult_small: 1.5
+  density_precision_penalty_mult_large: 0.8
   update_topk: 7
   update_use_aux_outputs: True
   update_use_enc_aux_outputs: False
@@ -37,19 +55,38 @@ PointSupDEIMCriterionScaleAdaptiveInitScoreThreshSchedule:
     min_wh: 0.005
     max_wh: 0.90
     ema: 0.90
+    
+    # ==============================================================
+    # 🌟 修复区：加回限制框膨胀的物理底线，彻底杜绝 NaN 梯度爆炸！
     score_thresh: 0.20
+    density_recall_penalty: 1.5       # 兜底：防止小目标漏掉特征
+    density_precision_penalty: 1.35   # 紧箍咒：死死勒住边界，绝对不许向背景膨胀！
+    # ==============================================================
+    
     center_radius: 0.02
     class_agnostic_warmup_epochs: 4
     require_point_inside: True
+    require_point_inside_by_area: True
+    require_point_inside_area_thresh: 0.01
     max_scale_up: 1.6
     max_scale_down: 0.2
+    area_aware: True
+    area_aware_low: 0.0025
+    area_aware_high: 0.09
+    center_radius_mult_small: 0.7
+    center_radius_mult_large: 1.5
+    max_scale_up_mult_small: 0.8
+    max_scale_up_mult_large: 1.3
+    max_scale_down_mult_small: 2.0
+    max_scale_down_mult_large: 0.5
     aggregate_by_target: True
     score_weight_power: 1.0
     score_topk: 7
     score_topk_begin_epoch: 0
-    score_topk_end_epoch: 10
+    score_topk_end_epoch: 80
     refine_points: True
     refine_lamda: 0.5
+    refine_points_by: attn_center
     refine_begin_epoch: 0
     refine_end_epoch: 30
   adaptive_k: 1
@@ -87,6 +124,7 @@ train_dataloader:
         - {type: RandomHorizontalFlip}
         - {type: Resize, size: [640, 640]}
         - {type: SanitizeBoundingBoxes, min_size: 1}
+        - {type: PointAwareCopyPaste, p: 0.5, max_paste: 3, max_area_ratio: 0.01, bbox_pad: 0, max_iou: 0.1, max_trials: 50}
         - {type: ConvertPILImage, dtype: 'float32', scale: True}
         - {type: RandomErasing, p: 0.5, scale: [0.02, 0.20], ratio: [0.3, 3.3], value: 0}
         - {type: ConvertBoxes, fmt: 'cxcywh', normalize: True}

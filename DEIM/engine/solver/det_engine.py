@@ -120,7 +120,7 @@ def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, cri
             with dt[2]:   
             # 计算损失  
                 with torch.autocast(device_type=str(device), enabled=False):
-                    loss_dict = criterion(outputs, targets, **metas)    
+                    loss_dict = criterion(outputs, targets, images=samples, **metas)    
                 loss = sum(v for k, v in loss_dict.items() if "loss" in k)  # 总损失 
             
             with dt[3]:
@@ -139,7 +139,7 @@ def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, cri
             with dt[1]:  
                 outputs = model(samples, targets=targets)  # 前向传播
             with dt[2]:
-                loss_dict = criterion(outputs, targets, **metas)  # 计算损失
+                loss_dict = criterion(outputs, targets, images=samples, **metas)  # 计算损失
                 loss: torch.Tensor = sum(v for k, v in loss_dict.items() if "loss" in k)  # 总损失
             with dt[3]:    
                 optimizer.zero_grad()  # 清空梯度
