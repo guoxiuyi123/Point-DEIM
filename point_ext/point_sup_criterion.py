@@ -64,6 +64,7 @@ class PointSupDEIMCriterionV2(DEIMCriterion):
         reg_quality_weight: str = "none",
         reg_quality_power: float = 1.0,
         pseudo_box=None,
+        score_quality_mode: str = "max",
     ):
         super().__init__(
             matcher=matcher,
@@ -105,6 +106,7 @@ class PointSupDEIMCriterionV2(DEIMCriterion):
         self.density_precision_penalty_mult_small = float(density_precision_penalty_mult_small)
         self.density_precision_penalty_mult_large = float(density_precision_penalty_mult_large)
         self.density_area_reduce = str(density_area_reduce)
+        self.score_quality_mode = str(score_quality_mode).lower()  # "max" or "mixed"
         if isinstance(pseudo_box, dict):
             if "density_recall_penalty" in pseudo_box:
                 self.density_recall_penalty = float(pseudo_box["density_recall_penalty"])
@@ -356,18 +358,40 @@ class PointSupDEIMCriterionV2(DEIMCriterion):
             matched += int(tgt_idx.numel())
             labels = pseudo_targets[b]["labels"][tgt_idx]
 
+            # ============================================================================
+            # 🔧 修复：改进的置信度计算策略
+            # 原问题：在预热期后使用真实标签的置信度，导致置信度过低，伪框膨胀不足
+            # 解决方案：根据 score_quality_mode 选择置信度策略
+            # ============================================================================
             if self.matcher.use_focal_loss:
                 prob = logits.sigmoid()
-                if epoch < int(self.pseudo_box_cfg.class_agnostic_warmup_epochs):
-                    scores = prob.max(dim=-1).values
+                max_scores = prob.max(dim=-1).values
+                
+                if self.score_quality_mode == "mixed":
+                    # 混合策略：主要用最大值，逐渐混入真实标签置信度
+                    if epoch < int(self.pseudo_box_cfg.class_agnostic_warmup_epochs):
+                        scores = max_scores
+                    else:
+                        # 线性插值：随着epoch增加，逐渐增加真实标签权重
+                        label_scores = prob.gather(1, labels[:, None]).squeeze(1)
+                        alpha = min(0.3, (epoch - int(self.pseudo_box_cfg.class_agnostic_warmup_epochs)) / 50.0)
+                        scores = (1.0 - alpha) * max_scores + alpha * label_scores
                 else:
-                    scores = prob.gather(1, labels[:, None]).squeeze(1)
+                    # 默认"max"模式：全程使用类别最大置信度
+                    scores = max_scores
             else:
                 prob = logits.softmax(-1)
-                if epoch < int(self.pseudo_box_cfg.class_agnostic_warmup_epochs):
-                    scores = prob.max(dim=-1).values
+                max_scores = prob.max(dim=-1).values
+                
+                if self.score_quality_mode == "mixed":
+                    if epoch < int(self.pseudo_box_cfg.class_agnostic_warmup_epochs):
+                        scores = max_scores
+                    else:
+                        label_scores = prob.gather(1, labels[:, None]).squeeze(1)
+                        alpha = min(0.3, (epoch - int(self.pseudo_box_cfg.class_agnostic_warmup_epochs)) / 50.0)
+                        scores = (1.0 - alpha) * max_scores + alpha * label_scores
                 else:
-                    scores = prob.gather(1, labels[:, None]).squeeze(1)
+                    scores = max_scores
 
             if dino_feat is not None and dino_hw is not None and int(scores.numel()) > 0:
                 k = int(getattr(self, "dino_semantic_max_boxes", 64))
